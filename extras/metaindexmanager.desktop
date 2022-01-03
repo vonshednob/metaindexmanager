@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Encoding=UTF-8
+Name=metaindexmanager
+Comment=Metadata manager and file browser
+TryExec=metaindexmanager
+Exec=metaindexmanager
+Terminal=true
+Type=Application
+Categories=Utility;ConsoleOnly
