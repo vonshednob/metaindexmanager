@@ -67,7 +67,7 @@ setuptools.setup(
     data_files=[('share/man/man1', ['man/metaindexmanager.1']),
                 ('share/applications', ['extras/metaindexmanager.desktop',]),
                 ('share/doc/metaindexmanager', ['extras/mtattach.sh'])],
-    install_requires=['metaindex>=0.4.0', 'cursedspace>=1.3.1'],
+    install_requires=['metaindex>=0.5.0', 'cursedspace>=1.3.1'],
     extras_require={},
     python_requires='>=3.8',
     classifiers=['Development Status :: 3 - Alpha',
@@ -76,4 +76,3 @@ setuptools.setup(
                  'License :: OSI Approved :: MIT License',
                  'Natural Language :: English',
                  'Programming Language :: Python :: 3',])
-

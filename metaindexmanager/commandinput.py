@@ -29,7 +29,10 @@ class CommandCompletion(Completion):
             if cmd is not None and isinstance(targetpanel, cmd.ACCEPT_IN):
                 alternatives = cmd().completion_options(self.app.make_context(), *parts[1:])
 
-        if len(alternatives) > 0:
+        if len(parts) > 0 and len(alternatives) == 1 and alternatives[0] == parts[-1]:
+            self.close()
+            self.app.paint()
+        elif len(alternatives) > 0:
             self.set_alternatives(alternatives, (y, x))
             self.app.paint()
         elif self.is_visible:

@@ -105,8 +105,10 @@ class Application(cursedspace.Application):
         # the mapping is 'sequence of keys' to 'command'
         # command can be either of these:
         # - 'command', name of a command (to be resolved and executed as is)
-        # - '::command param1 param2', command with parameters to be executed as such
-        # - ':command param1', command to be filled into the command line and the user has to complete it
+        # - '::command param1 param2', command with parameters to be executed
+        #    as such
+        # - ':command param1', command to be filled into the command line and
+        #    the user has to complete it
         self.keys = [
             (ANY_SCOPE, ('q', ), ('close',)),
             (ANY_SCOPE, ('X', ), ('quit',)),
@@ -288,11 +290,11 @@ class Application(cursedspace.Application):
 
             if key == Key.TIMEOUT:
                 timed_out = True
-            
+
             elif key == Key.RESIZE:
                 self.resize_panels()
                 self.paint()
-            
+
             elif self.blocking_task is not None:
                 self.blocking_task.handle_key(key)
 
@@ -324,7 +326,7 @@ class Application(cursedspace.Application):
                             self.current_panel.handle_key(seq)
                     elif commandname.startswith(':') and not commandname.startswith('::'):
                         prefill = shlex.split(commandname[1:])
-                        prefill = shlex.join([prefill[0]] + sum([expand_part(self, part) for part in prefill[1:]], start=[]))
+                        prefill = shlex.join([prefill[0]] + sum([expand_part(self, part) for part in prefill[1:]], start=[])) + " "
                         self.execute_command("enter-command", prefill)
                     else:
                         args = None
@@ -884,66 +886,6 @@ class Application(cursedspace.Application):
 
         return value.replace('\0', '').strip()
 
-    def get_preferred_sidecar_stores(self):
-        """Returns a list of all available metadata stores, sorted by preference of the user"""
-        preferred = self.configuration.list(ALL_SCOPE, PREF_SIDECAR, DEFAULT_SIDECARS)
-        preferred = [stores.BY_SUFFIX[suffix] for suffix in preferred if suffix in stores.BY_SUFFIX]
-        return preferred \
-             + [store for store in stores.STORES if store not in preferred]
-
-    def get_editable_sidecar_file(self, filepath):
-        """Get the editable sidecar file path for this file
-
-        Returns a tuple (path, is_collection, store) with the pathlib.Path to the sidecar file
-        (which may or may not exist), a boolean whether or not the sidecar file is a collection
-        file, and the store module that can be used to read/write the metadata to this sidecar.
-
-        May return (None, False, None) in case there is no usable storage. In that case it will
-        write a message into the error log, too.
-        """
-        # find what type of metadata file should be used
-        sidecar = None
-        is_collection = None
-        all_stores = [(store, hasattr(store, 'store')) for store in self.get_preferred_sidecar_stores()]
-        usable_stores = [store for store, usable in all_stores if usable]
-        if len(usable_stores) == 0:
-            logger.error(f"No usable sidecar storage formats available")
-            return None, False, None
-
-        prefer_collection = False
-
-        # find existing sidecar file
-        for store, usable in all_stores:
-            location = filepath.parent / (filepath.stem + store.SUFFIX)
-            if location.is_file() and usable:
-                sidecar = location
-                break
-
-        # if there was none, find existing collection sidecar file
-        if sidecar is None:
-            for store, is_usable in all_stores:
-                for collection_name in self.collection_metadata:
-                    location = filepath.parent / (collection_name + store.SUFFIX)
-                    if location.is_file():
-                        if is_usable:
-                            sidecar = location
-                            is_collection = True
-                            break
-                        else:
-                            prefer_collection = True
-                if sidecar is not None:
-                    break
-        # still none? just take the first preferred sidecar store and create a sidecar file
-        if sidecar is None:
-            if prefer_collection:
-                sidecar_name = self.collection_metadata[0]
-                is_collection = True
-            else:
-                sidecar_name = filepath.stem
-            sidecar = filepath.parent / (sidecar_name + usable_stores[0].SUFFIX)
-
-        return sidecar, is_collection, stores.BY_SUFFIX[sidecar.suffix]
-
     def determine_sidecar_file(self, filepath):
         """Determines the most likely sidecar file for the given filepath
 
@@ -964,7 +906,7 @@ class Application(cursedspace.Application):
             if candidate is None:
                 # remember the very first option for later in case we find no existing sidecar file
                 candidate = path
-            
+
             if path.is_file():
                 return path, False
 

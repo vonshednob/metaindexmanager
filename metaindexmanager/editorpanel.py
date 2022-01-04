@@ -69,6 +69,7 @@ class EditorLine(InputLine):
 
 
 class EditorPanel(ListPanel):
+    """Metadata editing panel"""
     SCOPE = 'editor'
     SPACING = 3
 
@@ -81,17 +82,18 @@ class EditorPanel(ListPanel):
         self.columns = []
         # the history of changes
         self.changes = []
-        # the pointer into the history of changes, usually points beyond the end of the list of changes
+        # the pointer into the history of changes,
+        # usually points beyond the end of the list of changes
         self.change_ptr = 0
         # list of items directly after reload
         self.unchanged_items = []
         self.editor = None
         self.metadata = multidict.MultiDict()
 
-        self._multiline_icon = None
-        self._cutoff_icon = None
+        self._multiline_icon = ' '
+        self._cutoff_icon = ' '
         self.configuration_changed()
-        
+
         self.reload()
         self.cursor = 1
 
@@ -208,28 +210,31 @@ class EditorPanel(ListPanel):
 
     def save(self, blocker):
         logger.debug(f"The file is {self.selected_path.name}")
-        blocker.title(f"Saving changes to {self.selected_path.name}")
+        if blocker is not None:
+            blocker.title(f"Saving changes to {self.selected_path.name}")
 
         # Read in the current sidecar file, if it exists
         collection_extra = None
-        sidecar_file, is_collection, store = self.app.get_editable_sidecar_file(self.selected_path)
+        sidecar_file, is_collection, store = \
+            self.app.metaindexconf.resolve_sidecar_for(self.selected_path)
 
         if sidecar_file is None:
-            self.app.error(f"No usable metadata storage available")
+            self.app.error("No usable metadata storage available")
             return
 
         if sidecar_file.exists():
             if is_collection:
                 collection_extra = store.get_for_collection(sidecar_file, prefix='')
 
-                collection_extra = utils.collection_meta_as_writable(collection_extra, sidecar_file.parent)
-                logger.debug(f"Read collection metadata: {collection_extra}")
+                collection_extra = \
+                    utils.collection_meta_as_writable(collection_extra, sidecar_file.parent)
+                logger.debug("Read collection metadata: %s", collection_extra)
 
                 if self.selected_path.name in collection_extra:
                     extra = collection_extra.pop(self.selected_path.name)
                 else:
                     extra = multidict.MultiDict()
-                logger.debug(f"Extra for {self.selected_path.name} is: {extra}")
+                logger.debug("Extra for %s is: %s", self.selected_path.name, extra)
 
             else:
                 extra = store.get(sidecar_file, prefix='')
@@ -290,6 +295,7 @@ class EditorPanel(ListPanel):
 
         # save the extra metadata to the sidecar file
         if is_collection:
+            assert collection_extra is not None
             collection_extra[self.selected_path.name] = extra
             logger.debug(f"Updating collection sidecar to {collection_extra}")
             store.store(collection_extra, sidecar_file)
@@ -299,14 +305,17 @@ class EditorPanel(ListPanel):
         # reload the cache
         with ShellContext(self.app.screen):
             self.app.cache.refresh(self.selected_path)
+            self.app.cache.wait_for_write()
         self.app.paint(True)
 
         # reset
         self.reset()
 
     def reload(self):
-        filepath = str(self.item)
-        metadata = [entry.metadata for entry in self.app.cache.get(self.item) if entry.path == self.item]
+        logger.debug("Reloading %s", self.item)
+        metadata = [entry.metadata
+                    for entry in self.app.cache.get(self.item)
+                    if entry.path == self.item]
 
         if len(metadata) == 0:
             self.metadata = multidict.MultiDict({'filename': str(self.selected_path.name)})
@@ -367,7 +376,11 @@ class EditorPanel(ListPanel):
             self.items += [Header(g, g.title())
                            for g in set([i.group for i in self.items])]
 
-            self.items.sort(key=lambda k: [k.group != 'extra', k.group, isinstance(k, Line), k.tag.lower(), self.app.humanize(k.value).lower()])
+            self.items.sort(key=lambda k: [k.group != 'extra',
+                                           k.group,
+                                           isinstance(k, Line),
+                                           k.tag.lower(),
+                                           self.app.humanize(k.value).lower()])
 
     def do_paint_item(self, y, x, maxwidth, is_selected, item):
         if isinstance(item, Header):
@@ -426,7 +439,6 @@ class EditorPanel(ListPanel):
     def add_tag(self, name):
         if self.editor is not None:
             self.cancel_edit()
-        tagname = f'extra.{name}'
 
         self.changed(Insert('extra', name, ''))
 
@@ -509,12 +521,14 @@ class EnterEditMode(command.Command):
         if not isinstance(item, Line):
             return
 
-        if item.prefix == 'extra' or (isinstance(item.value, str) and ('\n' in item.value or '\r' in item.value)):
+        if item.prefix == 'extra' or \
+           (isinstance(item.value, str) and ('\n' in item.value or '\r' in item.value)):
             context.panel.start_edit()
 
 
 @command.simple_command("edit-multiline", (EditorPanel,))
 def edit_multiline_command(context):
+    """Edit the tag value in an external editor"""
     target = context.panel
     if target.is_busy:
         return
@@ -522,16 +536,28 @@ def edit_multiline_command(context):
     context.panel.multiline_edit()
 
 
-@command.simple_command('add-tag', (EditorPanel,))
-def execute(context, name=None):
+@command.registered_command
+class AddTagCommand(command.Command):
     """Add a new metadata field"""
-    if context.panel.is_busy:
-        return
-    if name is None:
-        context.application.error(f"Usage: add-attr name")
-        return
+    NAME = 'add-tag'
+    ACCEPT_IN = (EditorPanel,)
 
-    context.panel.add_tag(name)
+    def completion_options(self, context, *args):
+        text = "" if len(args) == 0 else args[0]
+        keys = {key.split('.', 1)[1]
+                for key in context.application.cache.keys()
+                if key.startswith('extra.')}
+        keys |= shared.DUBLINCORE_TAGS
+        return list(key for key in sorted(keys) if key.startswith(text))
+
+    def execute(self, context, name=None):
+        if context.panel.is_busy:
+            return
+        if name is None:
+            context.application.error("Usage: add-attr name")
+            return
+
+        context.panel.add_tag(name)
 
 
 @command.registered_command
@@ -567,6 +593,7 @@ class ReplaceValueForAttribute(command.Command):
 
         context.panel.start_edit(text='')
 
+
 @command.registered_command
 class RemoveAttribute(command.Command):
     """Remove the selected metadata field"""
@@ -579,11 +606,11 @@ class RemoveAttribute(command.Command):
         item = context.panel.selected_line
 
         if isinstance(item, Header):
-            context.application.error(f"Selected field cannot be deleted")
+            context.application.error("Selected field cannot be deleted")
             return
         if item.prefix != 'extra':
             # TODO support the null override of values
-            context.application.error(f"Selected field cannot be deleted")
+            context.application.error("Selected field cannot be deleted")
             return
         context.panel.remove_tag(context.panel.selected_line)
 
@@ -686,6 +713,7 @@ def copy_append_tag_command(context, clipboard=None):
 
 @command.simple_command("paste-tag", (EditorPanel,))
 def paste_tag_command(context, clipboard=None):
+    """Paste tag and value from clipboard"""
     target = context.panel
     if target.is_busy:
         return
@@ -720,8 +748,6 @@ class RunRules(command.Command):
 
     def run_rules(self, blocker, context, path):
         blocker.title(f"Running rules on {path.name}")
-        
-        item = context.panel.selected_item
 
         base = context.application.cache.get(path, False)
         if len(base) == 0:
@@ -739,7 +765,7 @@ class RunRules(command.Command):
                                                     True,
                                                     context.application.metaindexconf)
             if len(results) == 0:
-                logger.debug(f"Indexers returned no results")
+                logger.debug("Indexers returned no results")
                 return
             _, success, base = results[0]
 
@@ -760,7 +786,7 @@ class RunRules(command.Command):
             if not success:
                 logger.debug(f"Indexer did not succeed")
                 return
-            
+
             # extend the cached metadata with the newly indexed data
             new_info = False
             for key in set(extra.keys()):
@@ -777,5 +803,4 @@ class RunRules(command.Command):
         context.application.cache.insert(path, info.metadata)
 
         context.application.callbacks.put((context.panel,
-                                           lambda: context.panel.reload()))
-
+                                           context.panel.reload))
