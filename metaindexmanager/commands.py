@@ -661,11 +661,11 @@ class RunIndexers(Command):
 
     def run_indexers(self, blocker, context, path):
         blocker.title(f"Running indexers on {path.name}")
-        
+
         item = context.panel.selected_item
 
         if path.is_dir():
-            paths = context.application.cache.cache.find_indexable_files([path])
+            paths = context.application.cache.find_indexable_files([path])
         else:
             paths = [path]
 
@@ -677,7 +677,7 @@ class RunIndexers(Command):
 
         # merge the results
         for idx, result in enumerate(results):
-            lpath, success, extra = results[0]
+            lpath, success, extra = result
 
             base = context.application.cache.get(lpath, False)
             if len(base) == 0:
@@ -689,7 +689,7 @@ class RunIndexers(Command):
                 logger.debug(f"Indexer did not succeed on {lpath}")
                 continue
             logger.debug(f"Indexer found something for {lpath}")
-            
+
             # extend the cached metadata with the newly indexed data
             newly_added = False
             for key in set(extra.keys()):
@@ -713,4 +713,3 @@ class RunIndexers(Command):
         elif isinstance(context.panel, (EditorPanel,)):
             context.application.callbacks.put((context.panel,
                                                lambda: context.panel.reload()))
-

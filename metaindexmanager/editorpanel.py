@@ -305,7 +305,7 @@ class EditorPanel(ListPanel):
         # reload the cache
         with ShellContext(self.app.screen):
             self.app.cache.refresh(self.selected_path)
-            self.app.cache.wait_for_write()
+            self.app.cache.wait_for_reload()
         self.app.paint(True)
 
         # reset

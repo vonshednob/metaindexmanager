@@ -262,6 +262,18 @@ The following options exist:
     What text editor to use when a text editor should be launched from
     within metaindexmanager.
 
+  ``all.opener``
+    What program to use to open files for viewing in an external program.
+
+    A good program to use is ``rifle`` of the ranger file manager.
+
+    The default is ``xdg-open``.
+
+  ``all.history-size``
+    How many entries should be remembered in the command history.
+
+    Defaults to ``1000``.
+
   ``files.use-icons``
     Set this to ``yes`` (or ``1``, ``y``, ``on``) to use icons in the
     file and folder listing. That means that the shell variables
@@ -270,7 +282,8 @@ The following options exist:
 
     The format of ``LS_ICONS`` and ``USERDIR_ICONS`` is based on
     ``LS_COLORS``: a ``:`` separated list of filetype/folder names assigned
-    to font awesome/nerdfont icons.
+    to font awesome/nerdfont icons (the following examples will look broken
+    if you don’t have font awesome or nerdfont installed).
     For example, if you want to use a special icon for your downloads and
     music folders, you could set your ``USERDIR_ICONS`` variable to
     ``downloads=:music=``.

@@ -59,9 +59,9 @@ CONFIGFILE = CONFIGPATH / "config.rc"
 
 PREF_OPENER = 'opener'
 DEFAULT_OPENER = 'xdg-open'
-PREF_SIDECAR = 'preferred-sidecar-format'
-DEFAULT_SIDECARS = '.json'
 PREF_EXT_EDITOR = 'editor'
+PREF_HIST_SIZE = 'history-size'
+DEFAULT_HIST_SIZE = '1000'
 
 
 class Context:
@@ -131,6 +131,7 @@ class Application(cursedspace.Application):
             (DocPanel.SCOPE, ('g', 'd'), ('details',)),
             (FilePanel.SCOPE, ('c', 'd'), (':cd',)),
             (FilePanel.SCOPE, ('d', 'D'), ('rm',)),
+            (FilePanel.SCOPE, ('a',), (':rename %n',)),
             (FilePanel.SCOPE, ('y', 'y'), ('copy',)),
             (FilePanel.SCOPE, ('y', 'a'), ('append',)),
             (FilePanel.SCOPE, ('!', ), (':shell',)),
@@ -185,8 +186,7 @@ class Application(cursedspace.Application):
         self.blocking_task = None
 
         conf = configparser.ConfigParser(interpolation=None)
-        conf.read_dict({ALL_SCOPE: {PREF_OPENER: DEFAULT_OPENER,
-                                    PREF_SIDECAR: DEFAULT_SIDECARS}})
+        conf.read_dict({ALL_SCOPE: {PREF_OPENER: DEFAULT_OPENER}})
         self.configuration = metaindex.configuration.BaseConfiguration(conf)
         utils.parse_ls_colors()
         utils.parse_ls_icons()
@@ -231,12 +231,12 @@ class Application(cursedspace.Application):
 
         self.metaindexconf = metaindex.configuration.load(args.metaindex_config)
         self.cache = MemoryCache(self.metaindexconf)
+        self.cache.start()
 
         configpath = pathlib.Path(args.config).expanduser().resolve()
         self.load_config_file(configpath)
 
     def main(self):
-        self.cache.start()
         self.command_input = None
         if len(self.start_locations) > 0:
             for location in self.start_locations:
@@ -325,8 +325,12 @@ class Application(cursedspace.Application):
                         if self.current_panel is not None:
                             self.current_panel.handle_key(seq)
                     elif commandname.startswith(':') and not commandname.startswith('::'):
-                        prefill = shlex.split(commandname[1:])
-                        prefill = shlex.join([prefill[0]] + sum([expand_part(self, part) for part in prefill[1:]], start=[])) + " "
+                        rawprefill = shlex.split(commandname[1:])
+                        prefill = shlex.join([rawprefill[0]]
+                                             + sum([expand_part(self, part)
+                                                    for part in rawprefill[1:]], start=[]))
+                        if len(rawprefill) == 1:
+                            prefill += " "
                         self.execute_command("enter-command", prefill)
                     else:
                         args = None
@@ -352,13 +356,22 @@ class Application(cursedspace.Application):
         try:
             retval = super().run()
         except Exception as exc:
+            retval = -1
             stored_exc = exc
 
         self.cache.quit()
 
         try:
-            HISTORYFILE.write_text("\n".join([command for command in self.command_history
-                                                      if len(command.strip()) > 0]))
+            history_size = int(self.configuration.get(ALL_SCOPE,
+                                                      PREF_HIST_SIZE,
+                                                      DEFAULT_HIST_SIZE))
+        except ValueError:
+            history_size = int(DEFAULT_HIST_SIZE)
+
+        try:
+            HISTORYFILE.write_text("\n".join([command
+                                              for command in self.command_history[-1*history_size:]
+                                              if len(command.strip()) > 0]))
         except Exception as exc:
             logger.error(f"Could not write to the history file {HISTORYFILE}: {exc}")
 
@@ -885,40 +898,6 @@ class Application(cursedspace.Application):
         assert isinstance(value, str)
 
         return value.replace('\0', '').strip()
-
-    def determine_sidecar_file(self, filepath):
-        """Determines the most likely sidecar file for the given filepath
-
-        Returns tuple (pathlib.Path, collection) with the path to the sidecar file
-        and whether or not it is/should be a collection sidecar file.
-
-        CAVEAT: The path to the sidecar file may not exist!
-        """
-        candidate = None
-        preferred_sidecar_format = self.configuration.list(ALL_SCOPE,
-                                                           PREF_SIDECAR,
-                                                           DEFAULT_SIDECARS)
-        all_sidecar_formats = preferred_sidecar_format + [store.SUFFIX for store in stores.STORES]
-        # try direct sidecar files first
-        for suffix in all_sidecar_formats:
-            path = filepath.parent / (filepath.stem + suffix)
-
-            if candidate is None:
-                # remember the very first option for later in case we find no existing sidecar file
-                candidate = path
-
-            if path.is_file():
-                return path, False
-
-        # try if there's a collection file
-        for suffix in all_sidecar_formats:
-            for stem in self.collection_metadata:
-                path = filepath.parent / (stem + suffix)
-                if path.is_file():
-                    return path, True
-
-        # Nothing there, let's just use the first candidate
-        return candidate, False
 
     @property
     def collection_metadata(self):

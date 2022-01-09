@@ -1,4 +1,3 @@
-import datetime
 import pathlib
 import shlex
 import curses
@@ -11,7 +10,7 @@ from metaindexmanager.utils import logger
 from metaindexmanager.panel import ListPanel
 
 
-DEFAULT_COLUMNS = "title, filename, tags+, mimetype"
+DEFAULT_COLUMNS = "title filename tags+ mimetype"
 
 
 class DocPanel(ListPanel):
@@ -212,7 +211,10 @@ class DocPanel(ListPanel):
             self.app.error("Nothing selected")
             return
         path = pathlib.Path(self.selected_item[-1][0])
-        self.app.open_file(path)
+        if path.is_file():
+            self.app.open_file(path)
+        else:
+            self.app.error(f"File '{path}' not found")
 
 
 @command.registered_command

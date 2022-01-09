@@ -4,9 +4,11 @@ import os
 import shutil
 import threading
 import subprocess
-import time
 
-from cursedspace import Key, Panel, colors, ShellContext
+from cursedspace import Panel, colors, ShellContext
+
+from metaindex import stores
+from metaindex.shared import IS_RECURSIVE
 
 from metaindexmanager import command
 from metaindexmanager import utils
@@ -62,24 +64,31 @@ class FolderObserver(threading.Thread):
         self.items = items[:] if items else []
         self.active = False
         self.do_interrupt = threading.Event()
-    
+
     def run(self):
         self.active = True
         text = None
         while self.active:
-            items = [item for item in self.path.iterdir()]
+            items = list(self.path.iterdir())
             newtext = "\n".join([str(i) for i in sorted(items)])
-            if text is None or text != newtext:
+            if text is None or text != newtext and self.active:
                 text = newtext
                 self.panel.app.callbacks.put((self.panel, lambda: self.on_change(items)))
             self.do_interrupt.wait(2)  # TODO: should be configurable
+            self.do_interrupt.clear()
+
+    def wake_up(self):
+        """Wake up the thread to re-read the folder"""
+        self.do_interrupt.set()
 
     def on_change(self, items):
+        """Called when the content of the currently watched folder changes"""
         if self.active:
             return self.panel.finish_change_path([Line(self.panel, i) for i in items])
         return False
 
     def close(self):
+        """Close and exit this thread"""
         self.active = False
         self.do_interrupt.set()
         self.join()
@@ -204,19 +213,83 @@ class FilePanel(ListPanel):
                          lambda: self.run_blocking(self.do_delete, items))
 
     def do_delete(self, context, items):
-        for nr, item in enumerate(items):
+        for counter, item in enumerate(items):
             if len(items) > 1:
-                context.progress((nr, len(items)))
+                context.progress((counter, len(items)))
             if item.is_dir():
                 try:
                     shutil.rmtree(item)
-                except Exception as exc:
+                except OSError as exc:
                     self.app.error(f"Failed to delete the folder '{item.name}': {exc}")
             elif item.exists():
+                delete_sidecars = False
                 try:
                     item.unlink()
-                except Exception as exc:
+                    delete_sidecars = True
+                except OSError as exc:
                     self.app.error(f"Failed to delete '{item.name}': {exc}")
+                    logger.error("Failed to delete %s: %s", item, exc)
+
+                if delete_sidecars:
+                    for sidecar, is_collection in self.app.metaindexconf.find_all_sidecar_files(item):
+                        if is_collection:
+                            # TODO: drop *specific* entries from this file
+                            continue
+                        try:
+                            sidecar.unlink()
+                        except OSError as exc:
+                            logger.error("Failed to delete sidecar file %s: %s", sidecar, exc)
+        if self.observer is not None:
+            self.observer.wake_up()
+
+    def rename(self, path, new_name):
+        assert path.parent == new_name.parent
+
+        is_sidecar = self.app.metaindexconf.is_sidecar_file(path)
+        rename_sidecars = []
+        rename_inside_sidecars = []
+        if not is_sidecar:
+            for sidecar, is_collection in self.app.metaindexconf.find_all_sidecar_files(path):
+                if is_collection:
+                    rename_inside_sidecars.append(sidecar)
+                else:
+                    rename_sidecars.append((sidecar,
+                                            sidecar.parent / (new_name.stem + sidecar.suffix)))
+
+        for sidecar, new_sidecar in rename_sidecars:
+            if new_sidecar.exists():
+                self.app.error(f"{new_sidecar.name} already exists. "
+                               "Please delete or merge the metadata files yourself.")
+                return
+
+        try:
+            os.rename(path, new_name)
+        except OSError as exc:
+            self.app.error(f"Failed to rename: {exc}")
+            logger.error(f"Could not rename '{path}' to '{new_name}': {exc}")
+            return
+
+        self.app.cache.rename(path, new_name, new_name.is_dir())
+
+        for sidecar, new_sidecar in rename_sidecars:
+            try:
+                os.rename(sidecar, new_sidecar)
+            except OSError as exc:
+                self.app.error(f"Failed to rename {sidecar.name}.")
+                logger.error(f"Failed to rename {sidecar} to {new_sidecar}: {exc}")
+
+        for sidecar in rename_inside_sidecars:
+            metadata = stores.get_for_collection(sidecar)
+            if path not in metadata:
+                continue
+            entry = metadata.pop(path)
+            metadata[new_name] = entry
+            stores.store(stores.as_collection(metadata), sidecar)
+
+        logger.debug("Renamed %s to %s on disk and in cache", path, new_name)
+
+        if self.observer is not None:
+            self.observer.wake_up()
 
     def reload(self):
         self.change_path(self.path)
@@ -381,6 +454,34 @@ class ToggleShowHiddenFiles(command.Command):
         context.panel.show_hidden_files = not context.panel.show_hidden_files
         context.panel.change_path(context.panel.path)
         context.panel.paint(True)
+
+
+@command.registered_command
+class RenameFile(command.Command):
+    """Rename this file or folder"""
+    NAME = 'rename'
+    ACCEPT_IN = (FilePanel,)
+
+    def execute(self, context, name=None):
+        if context.panel.is_busy:
+            return
+
+        if name is None:
+            context.application.error("Usage: rename new-file-name")
+            return
+
+        path = context.panel.selected_path
+        new_name = path.parent / name
+
+        if path.parent != new_name.parent:
+            context.application.error("Only renaming allowed, no moving")
+            return
+
+        if new_name.exists():
+            context.application.error("'{name}' already exists here")
+            return
+
+        context.panel.rename(path, new_name)
 
 
 @command.simple_command('shell', accept_in=(FilePanel,))
