@@ -15,7 +15,7 @@ import configparser
 
 import metaindex.configuration
 import metaindex.logger
-from metaindex import stores
+from metaindex import stores as _
 from metaindex.cache import MemoryCache
 
 import cursedspace
@@ -410,7 +410,7 @@ class Application(cursedspace.Application):
             self.prevent_paint = True
             self.queued_paint = []
             cleanup = True
-        
+
         command.execute(self.make_context(), *args, **kwargs)
 
         if cleanup:
@@ -511,7 +511,7 @@ class Application(cursedspace.Application):
         logger.debug("global refresh called")
         if len(self.panels) < 1:
             return
-        
+
         self.layout.refresh(force)
 
         if self.command_input is not None:
@@ -619,7 +619,7 @@ class Application(cursedspace.Application):
             title = activepanel.title()
         self.screen.addstr(0, 0, title[:width-1])
         self.screen.noutrefresh()
-        
+
         x = width - len(''.join(panels))
         for idx, text in enumerate(panels):
             attr = curses.A_STANDOUT if idx == curidx else curses.A_NORMAL
@@ -641,7 +641,8 @@ class Application(cursedspace.Application):
         if content is None:
             self.clear_clipboard(clipboard)
             return
-        elif isinstance(content, (list, tuple, set)):
+
+        if isinstance(content, (list, tuple, set)):
             self.named_clipboard[clipboard] = list(content)
         else:
             self.named_clipboard[clipboard] = [content]
@@ -717,7 +718,7 @@ class Application(cursedspace.Application):
                 return
             self.add_panel(panel)
             self.activate_panel(panel)
-            
+
             panel.jump_to(item)
 
     def restore_bookmarks(self):
@@ -726,7 +727,7 @@ class Application(cursedspace.Application):
         Bookmarks are stored one per line in plain text in this format:
 
             <mark> [f|d] <path> <path to item>
-        
+
         """
         if not BOOKMARKFILE.is_file():
             return
@@ -894,8 +895,9 @@ class Application(cursedspace.Application):
             value = value.strftime("%Y-%m-%d")
         elif isinstance(value, (int, float, bool)):
             value = str(value)
-
-        assert isinstance(value, str)
+        elif not isinstance(value, str):
+            logger.debug("Unexpected type '%s' to humanize", type(value))
+            value = str(value)
 
         return value.replace('\0', '').strip()
 
@@ -985,4 +987,3 @@ def run():
 
 if __name__ == '__main__':
     sys.exit(run())
-

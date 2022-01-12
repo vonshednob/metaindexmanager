@@ -160,7 +160,10 @@ class DocPanel(ListPanel):
         for column in range(len(self.fieldkeys)):
             if self.col_widths[column] < 2:
                 continue
-            text = item[column][:self.col_widths[column]]
+            text = item[column]
+            if column == 0 and item in self.multi_selection:
+                text = '✔ ' + text
+            text = text[:self.col_widths[column]]
             if column < len(self.fieldkeys) - 1 and len(text) >= self.col_widths[column]:
                 text = text[:-1] + ' '
             assert len(text) + x < self.dim[1]

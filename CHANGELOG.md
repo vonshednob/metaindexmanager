@@ -5,6 +5,16 @@ This file contains the changes made between released versions.
 The format is based on [Keep a changelog](https://keepachangelog.com/) and the versioning tries to follow
 [Semantic Versioning](https://semver.org).
 
+## 0.3.1
+### Fixed
+- Selecting the last item in the filepanel did not show the selection marker ([#1](https://github.com/vonshednob/metaindexmanager/issues/1))
+- Fixed crash when pasting in the metadata editor while the clipboard is empty
+- Fixed crash when humanizing values that are of unusual types
+- Fixed crash when attempting to edit metadata of a file in an external editor
+
+### Added
+- Document panel supports multi-selection in theory (ie. it can display the selection marks, but there is not command to select)
+
 
 ## 0.3.0
 ### Changed

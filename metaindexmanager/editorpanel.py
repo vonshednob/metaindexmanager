@@ -718,8 +718,11 @@ def paste_tag_command(context, clipboard=None):
     if target.is_busy:
         return
 
-    items = [item for item in context.application.get_clipboard_content(clipboard)
-             if isinstance(item, (Line,))]
+    content = context.application.get_clipboard_content(clipboard)
+    if content is None:
+        return
+
+    items = [item for item in content if isinstance(item, (Line,))]
     if len(items) == 0:
         return
 

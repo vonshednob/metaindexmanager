@@ -158,7 +158,7 @@ class ListPanel(ScrollPanel):
         self.reload_keybindings()
         self._is_busy = threading.Lock()
         self.multi_selection = []
-    
+
     def reload_keybindings(self):
         self.SCROLL_NEXT = extract_key_sequence(self.app, NEXT_ITEM)
         self.SCROLL_PREVIOUS = extract_key_sequence(self.app, PREV_ITEM)
@@ -208,7 +208,7 @@ class ListPanel(ScrollPanel):
 
     def handle_key(self, key):
         if self.is_busy:
-            return
+            return False
 
         return super().handle_key(key)
 
@@ -246,5 +246,3 @@ def extract_key_sequence(application, commandname):
     return [keys
             for scope, keys, cmd in application.keys
             if cmd[0] == commandname and scope == 'any']
-
-

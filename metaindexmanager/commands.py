@@ -11,6 +11,7 @@ import metaindex.shared
 import metaindex.indexer
 import metaindex.indexers
 import metaindex.ocr
+import metaindex.stores
 
 from metaindexmanager import layouts
 from metaindexmanager import utils
@@ -179,15 +180,31 @@ class EditMetadataExternally(Command):
             context.application.error("Nothing selected")
             return
 
-        sidecar, is_collection, store = context.application.get_editable_sidecar_file(file)
+        app = context.application
+
+        # Try to find an existing, non-collection
+        sidecar = None
+        store = None
+        is_collection = False
+        for fname, is_collection in app.metaindexconf.find_all_sidecar_files(file):
+            sidecar = fname
+            store = metaindex.stores.BY_SUFFIX.get(sidecar.suffix)
+            break
+
         if sidecar is None:
+            fname, is_collection, store_ = app.metaindexconf.resolve_sidecar_for(file)
+            if fname is not None:
+                sidecar = fname
+                store = store_
+
+        if store is None or sidecar is None:
+            app.error("No store set up to write into")
             return
 
         if sidecar == file:
-            context.application.error(f"Cannot edit metadata of a file that's probably a metadata file")
+            context.application.error("Cannot edit metadata of a file that's "
+                                      "probably a metadata file")
             return
-
-        logger.debug(f"Editing sidecar file {sidecar} (collection? {is_collection})")
 
         if sidecar.is_file():
             if is_collection:
@@ -199,7 +216,7 @@ class EditMetadataExternally(Command):
 
         else:
             # get the metadata for the selected item as a dict
-            results = context.application.cache.get(file)
+            results = app.cache.get(file)
             logger.debug(f"Cached metadata for {file}: {results}")
             meta = multidict.MultiDict()
 
@@ -557,15 +574,18 @@ class SetCommand(Command):
 @simple_command('select', (FilePanel,))
 def select_command(context):
     """Toggle whether or not the current item is selected"""
-    if context.panel.is_busy:
+
+    panel = context.panel
+    if panel.is_busy:
         return
 
-    item = context.panel.selected_item
-    if item in context.panel.multi_selection:
-        context.panel.multi_selection.remove(item)
+    item = panel.selected_item
+    if item in panel.multi_selection:
+        panel.multi_selection.remove(item)
     else:
-        context.panel.multi_selection.append(item)
-    context.panel.handle_key(context.panel.SCROLL_NEXT[0])
+        panel.multi_selection.append(item)
+    panel.paint_item(panel.cursor)
+    panel.handle_key(panel.SCROLL_NEXT[0])
 
 
 @registered_command
@@ -669,7 +689,11 @@ class RunIndexers(Command):
         else:
             paths = [path]
 
-        results = metaindex.indexer.index_files(paths, 1, metaindex.ocr.Dummy(), False)
+        results = metaindex.indexer.index_files(paths,
+                                                processes=1,
+                                                ocr_=metaindex.ocr.Dummy(),
+                                                fulltext=False,
+                                                config=context.application.metaindexconf)
         if len(results) == 0:
             return
 
