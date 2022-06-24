@@ -10,7 +10,7 @@ Synopsis
 
 ::
 
-  metaindexmanager [-h] [-m metaindex config file] [-l loglevel] [--log-file logfile] [--select-file-mode] [--select-file-output file] [location ...]
+  metaindexmanager [-h] [-v] [--check-for-update] [-m metaindex config file] [-l loglevel] [--log-file logfile] [--select-file-mode] [--select-file-output file] [location ...]
 
 
 Description
@@ -31,6 +31,13 @@ The general parameters are:
 
   ``-h``
     Show the help and exit.
+
+  ``-v``
+    Show the version and exit.
+
+  ``--check-for-update``
+    Check online on vonshednob.cc whether your version of metaindexmaneger
+    is up to date with the most recent published version.
 
   ``-m metaindex config file``
     Location of your metaindex config file. If not specified, the default
@@ -71,11 +78,12 @@ The general parameters are:
       metaindexmanager ~ "mimetype:image"
 
 
-
 Shortcuts
 =========
 
-The following default shortcuts are available in the various panels.
+All shortcuts and their respective help are available by typing ``?``,
+``F1``, or ``:help``.
+
 
 General
 -------
@@ -84,6 +92,8 @@ These shortcuts work in every panel:
 
 - ``q``, close the current panel
 - ``X``, quit metaindexmanager
+- ``?``, show the help,
+- ``F1``, show the help,
 - ``:``, enter a command
 - ``Tab``, next panel
 - ``gt``, next panel
@@ -102,6 +112,9 @@ These shortcuts work in every panel:
 - ``page up``, previous page
 - ``home``, go to start
 - ``end``, go to end
+- ``/``, find item by text
+- ``n``, find next item (uses text of ``/``)
+- ``N``, find previous item (uses text of ``/``)
 
 These shortcuts only work in the file browser:
 
@@ -114,10 +127,14 @@ These shortcuts only work in the file browser:
 - ``e``, edit metadata of the selected item
 - ``E``, edit metadata with an external text editor
 - ``!``, run a shell command or open a shell
+- ``O``, open the selected file with another program of your choice
 - ``cd``, change directory
 - ``dD``, delete the selected item (experimental)
 - ``yy``, copy the selected path to clipboard
 - ``ya``, append the selected path to clipboard
+- ``pp``, paste file(s) and/or folder(s) from clipboard
+- ``po``, paste file(s) and/or folder(s) from clipboard, overwriting existing files
+- ``pa``, paste file(s) and/or folder(s) from clipboard, in case of conflicting files generate a new, not conflicting filename
 - ``m``, mark the selected item for quick access
 - ``space``, select the item
 - ``uv``, clear selection
@@ -127,7 +144,6 @@ These shortcuts only work in the document browser:
 
 - ``R``, refresh
 - ``arrow right``, open the selected item in an external viewer
-- ``/``, enter a new search term
 - ``F3``, enter a new search term
 - ``gs``, enter a new search term
 - ``gl``, open currently selected item in new file browser
@@ -137,6 +153,7 @@ These shortcuts only work in the document browser:
 - ``m``, mark the selected item for quick access
 - ``e``, edit metadata of the selected item
 - ``E``, edit metadata with an external text editor
+- ``O``, open the selected file with another program of your choice
 
 These shortcuts only work in the metadata editor:
 
@@ -157,7 +174,20 @@ These shortcuts only work in the metadata editor:
 - ``ya``, append tag to clipboard
 - ``pp``, paste tag from clipboard
 - ``pP``, paste tag from clipboard
+- ``O``, open the file with another program of your choice
 
+
+Blocking operations
+-------------------
+
+When there’s a blocking operation on-going (like copying a lot of files,
+big files, or from mounted network drives), a blocking window will show the
+progress of the operation.
+
+You can request that the operation be cancelled by pressing ``Escape`` or
+``^C``. Metaindexmanager will do its best to cancel the running operations
+in a safe manner, but will not roll back any changes that have occurred
+already.
 
 
 Files
@@ -228,26 +258,66 @@ your files and ask you for ransom.
 Installing
 ----------
 
-To install an addon, copy the corresponding ``.py`` file into your addons
+To install an addon, copy the corresponding ``.py`` file or the module
+folder (the one containing the ``__init__.py`` file) into your addons
 folder (usually at ``~/.local/share/metaindexmanager/addons/``).
 
 
 Writing your own
 ----------------
 
-Currently there are two possible type of addons:
+Currently there are three possible types of addons:
 
- - commands, extending ``metaindexmanager.command.Command``, and
- - layouts, extending ``metaindexmanager.layouts.Layout``
+ - panels, extending ``metaindexmanager.panel.ListPanel`` or using the
+   ``metaindexmanager.panel.register`` decorator,
+ - commands, extending ``metaindexmanager.command.Command``,
+ - layouts, extending ``metaindexmanager.layouts.Layout``, and
+ - humanizer, providing formatters for tags, see ``metaindexmanager.humanize``
 
-Be sure to add the ``@registered_command`` or ``@registered_layout``
-decorators to your classes.
+Be sure to add the ``@registered_command``, ``@registered_layout``, or
+``@register_humanizer`` decorators to your classes or functions.
 
 Have a look at the layouts in ``metaindexmanager.layouts`` and the commands
 in ``metaindexmanager.commands`` to understand how commands work.
 ``metaindexmanager.docpanel`` and ``metaindexmanager.filepanel`` also have
 a bunch of commands defined that are restricted to these panels.
 
+At the end of ``metaindexmanager.humanize`` you can find a few examples of
+how to write tag value formatters.
+
+The use of the ``metaindexmanager.panel.register`` decorator allows you to
+create a new type of panel for use in bookmarks and as an option for
+``all.default-panel``. The constructor of your panel type must accept these
+parameters in order: ``application`` and ``location``. ``application`` is
+needed anyway for the underlying ``cursedspace.Panel``. ``location`` might
+be ``None`` or missing and you should be able to create the panel anyway.
+
+If you add a new panel, make sure there is also a command to open that panel
+one way or the other.
+
+
+Examples
+--------
+
+Here is an example of a humanizer to transform the value for XMP's
+``orientation`` tag into a human-readable value::
+
+    from metaindexmanager import humanize
+
+    @humanize.register_humanizer('Xmp.tiff.orientation')
+    def format_tiff_orientation(value):
+        mapping = {
+            '1': 'Horizontal',
+            '2': 'Mirrore horizontal',
+            '3': 'Rotate by 180°',
+            '4': 'Mirror vertical',
+            '5': 'Mirror horizontal and rotate 270° CW',
+            '6': 'Rotate 90° CW',
+            '7': 'Mirror horizontal and rotate 90° CW',
+            '8': 'Rotate 270° CW'
+        }
+
+        return mapping.get(str(value))
 
 
 Configuration options
@@ -274,6 +344,34 @@ The following options exist:
 
     Defaults to ``1000``.
 
+  ``all.border``
+    How much space should be wasted on drawing borders. Can be set to
+    either ``full`` or ``minimal``.
+
+    Defaults to ``full``.
+
+  ``all.info-timeout``
+    How long should errors or info messages be displayed at the bottom of
+    the screen. A duration of 4 days, 3 hours, 2 minutes, and 1 second
+    would be written like this: ``4d3h2m1s``.
+
+    Defaults to ``10s``.
+
+  ``all.default-panel``
+    What panel type should be opened by default when starting
+    *metaindexmanager* and no location has been specified?
+
+    Possible values are ``files``, and ``documents``.
+    Addons might add to the list of possible values, please refer to the
+    documentation of these addons.
+
+    Defaults to ``documents``.
+
+  ``all.find-case-sensitive``
+    Whether or not the ``find`` command should work case sensitive.
+
+    Defaults to ``no``.
+
   ``files.use-icons``
     Set this to ``yes`` (or ``1``, ``y``, ``on``) to use icons in the
     file and folder listing. That means that the shell variables
@@ -292,6 +390,38 @@ The following options exist:
     ``fi=f:di=F:*.jpeg=:*.jpg=``.
 
     metaindexmanager has some defaults built-in.
+
+  ``files.selection-icon``
+    What text symbol (or icon) to use to indicate selected files or
+    folders. The default is a blank space, but you could also use a
+    checkmark (``✔``).
+
+  ``files.info``
+    What extra information columns to show on the right side. Separate the
+    options with a comma. Possible options are:
+
+    - ``size``, the human-readable file size
+    - ``bytes``, the file size in bytes
+    - ``owner``, the owner's name or uid (only on \*nix)
+    - ``group``, the group's name or gid (only on \*nix)
+    - ``rights`` or ``mode``, the access rights in the form of ``-rw-r--r--`` (only on \*nix)
+    - ``num_rights`` or ``octmode``, the access rights as octal number
+    - ``lm_abs``, absolute date and time when the file was last modified
+    - ``lm_duration``, how long ago this file was last modified
+
+  ``files.show-hidden-files``
+    Whether or not to show hidden files. There's also a convenient command
+    ``toggle-hidden`` to toggle the display per panel instead of
+    program-wide.
+
+    Defaults to ``no``.
+
+  ``files.show-sidecar-files``
+    Whether or not to show sidecar files. There's also a convenient command
+    ``toggle-sidecar`` to toggle the display per panel instead of
+    program-wide.
+
+    Defaults to ``yes``.
 
   ``documents.columns``
     Defines the default columns for any new documents panel.
@@ -317,6 +447,44 @@ The following options exist:
     shown with the screen size.
 
     Defaults to ``→``.
+
+  ``editor.no-completion``
+    Comma separated list of ``extra`` tags that should not show any
+    completion.
+
+    Defaults to ``title``.
+
+  ``editor.tags``
+    Comma separated list of ``extra`` tags that should be shown as
+    suggestions in the ``add-tag`` command.
+
+    If you want to also see all other ``extra`` tags that have been set up
+    before, add the ``*`` value to the list, too.
+
+    Defaults to ``*, contributor, coverage, creator, date, description,
+    format, identifier, language, publisher, relation, rights, source,
+    subject, title, type``.
+
+  ``dictionary.<tag>``
+    The ``dictionary`` namespace of configuration options can be used by
+    you to define the allowed (or suggested) words for ``extra.`` metadata
+    values.
+
+    For example, if you set the ``dictionary.location`` to the values
+    ``home, work, cabin`` you will see a completion suggesting these values
+    when you add or edit a ``location`` tag using the editor panel.
+
+    If you want to allow all existing values of a given tag, and a few
+    suggestions, you can add the special value ``*``, like this::
+
+        set dictionary.rating "good, bad, ugly, *"
+
+    In this example if you had rated some file as ``meh``, this value would
+    also show in the completion when you add or edit a ``rating`` tag using
+    the editor panel.
+
+    If you don't define a dictionary for a tag, metaindexmanager will
+    always show the existing values as suggestions.
 
 
 
@@ -423,6 +591,22 @@ Here is a list of all commands:
 
     For available configuration options, see above in `Configuration options`_
 
+  ``find``
+    Find the entry that matches what you are trying to find.
+
+    Example: if you are in the file panel and want to find the next text
+    file in the listing, you could type ``:find .txt``
+
+  ``find-next``
+    Find the next entry that matches the previous ``find`` command.
+
+    Example: if you tried to ``:find .txt`` before and now execute
+    ``find-next``, it will repeat the ``find`` command and find the next
+    entry that matches ``.txt``.
+
+  ``find-prev``
+    Much like ``find-next``, but goes backwards rather than forwards.
+
   ``details``
     Open the metadata viewer to show all metadata for the currently
     selected file.
@@ -449,6 +633,11 @@ Here is a list of all commands:
 
     Only available in document browser, metadata editor, and file browser.
 
+  ``open-with``
+    Open the selected item with another program.
+
+    Only available in document browser, metadata editor, and file browser.
+
   ``select-and-exit``
     If started in ``--select-file-mode`` this command can be called to quit
     metaindexmanager and have the currently selected item be the file to
@@ -458,7 +647,7 @@ Here is a list of all commands:
     Only available in document browser and file browser.
 
   ``copy``
-    Copy the path of the currently selected item to the metaindexmanager
+    Copy the currently selected item to the metaindexmanager
     internal clipboard.
     This command accepts a parameter to identify the clipboard that you
     want to copy the path into. If no parameter is provided, the default
@@ -467,7 +656,7 @@ Here is a list of all commands:
     Only available in document browser and file browser.
 
   ``append``
-    Append the path of the currently selected item to the metaindexmanager
+    Append the currently selected item to the metaindexmanager
     internal clipboard.
     This command accepts a parameter to identift the clipboard that you
     want to use. See ``copy`` for more details on clipboard naming.
@@ -477,6 +666,22 @@ Here is a list of all commands:
   ``clear-clipboard``
     Clear the named clipboard (identified by the first parameter), or clear
     the default clipboard. See ``copy`` for more details on clipboards.
+
+  ``paste``
+    Paste the content of the clipboard (identified by the first parameter)
+    into the current panel, if the panel supports it.
+
+    In case of conflicting items in the current panel nothing will happen
+    and you will see an error.
+
+  ``paste-overwrite``
+    Paste, just like the ``paste`` command, but in case of conflicting
+    items in the current panel, overwrite them.
+
+  ``paste-append``
+    Paste, just like the ``paste`` command, but in case of conflicting
+    items in the current panel, create a new filename for the newly pasted
+    file that won’t be in conflict with any existing files.
 
   ``refresh``
     Refresh the current panel. This means reloading the content, not just
@@ -558,6 +763,14 @@ Here is a list of all commands:
     launched at this point, which you will have to exit to return to the
     metaindexmanager.
 
+  ``launch``
+    Execute a command in the shell in this folder. Can be used just like
+    ``shell``, but metaindexmanager will not wait for this program to
+    exit.
+
+    If you expect the launched program to produce some sort of output on
+    the terminal, you should rather use ``shell`` instead of ``launch``.
+
   ``toggle-hidden``
     Toggle whether or not hidden files should be shown.
 
@@ -574,7 +787,7 @@ Here is a list of all commands:
 
     The search term is passed into metaindex. Please check the syntax of
     search queries there. You can also find the documentation here:
-    https://github.com/vonshednob/metaindex/blob/main/doc/metaindex.rst#search-query-syntax
+    https://vonshednob.cc/metaindex/documentation.html#search-query-syntax
 
     Only available in the document browser.
 
@@ -651,24 +864,6 @@ Here is a list of all commands:
 
     Only available in the metadata editor.
 
-  ``copy-tag``
-    Copy the currently selected tag and value to the clipboard. If no
-    parameter is given, the default clipboard is used.
-
-    Only available in the metadata editor.
-
-  ``copy-append-tag``
-    Add the currently selected tag and value to the clipboard. If no
-    parameter is given, the default clipboard is used.
-
-    Only available in the metadata editor.
-
-  ``paste-tag``
-    Paste a copied tag from the clipboard. If no parameter is given, the
-    default clipboard's content is used.
-
-    Only available in the metadata editor.
-
 
 Usage Examples
 ==============
@@ -678,8 +873,8 @@ Bugs
 ====
 
 To be expected. Please report anything that you find at
-https://github.com/vonshednob/metaindexmanager or via email to the authors.
+https://github.com/vonshednob/metaindexmanager or via email to the authors
+at https://vonshednob.cc/metaindexmanager .
 
 Be sure to inspect your logfile for crash reports and add them to the bug
 report!
-

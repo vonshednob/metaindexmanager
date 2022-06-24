@@ -1,6 +1,7 @@
 import traceback
 import shlex
 
+from cursedspace import colors
 from cursedspace import InputLine, Key, Completion
 
 import metaindexmanager.command
@@ -9,6 +10,8 @@ from .command import resolve_command
 
 
 class CommandCompletion(Completion):
+    COLOR = colors.BLUE
+
     def update(self, y, x):
         targetpanel = self.app.previous_focus
         alternatives = []
@@ -21,15 +24,23 @@ class CommandCompletion(Completion):
         if len(parts) <= 1:
             if len(parts) == 0:
                 parts = [""]
-            alternatives = [name for name, cmd in sorted(metaindexmanager.command._registered_commands.items())
-                            if (len(parts[0]) == 0 or name.startswith(parts[0])) and isinstance(targetpanel, cmd.ACCEPT_IN)]
+            alternatives = [name
+                            for name, cmd in sorted(metaindexmanager.command._registered_commands.items())
+                            if (len(parts[0]) == 0 or
+                                name.startswith(parts[0]))
+                                and isinstance(targetpanel, cmd.ACCEPT_IN)]
 
         if len(parts) > 1 or text.endswith(' '):
             cmd = resolve_command(parts[0])
             if cmd is not None and isinstance(targetpanel, cmd.ACCEPT_IN):
                 alternatives = cmd().completion_options(self.app.make_context(), *parts[1:])
 
-        if len(parts) > 0 and len(alternatives) == 1 and alternatives[0] == parts[-1]:
+        only_alternative_typed_out = len(parts) > 0 and \
+                                     len(alternatives) == 1 and \
+                                     ((isinstance(alternatives[0], Completion.Suggestion) \
+                                       and alternatives[0].text == parts[-1]) or \
+                                      (alternatives[0] == parts[-1]))
+        if only_alternative_typed_out:
             self.close()
             self.app.paint()
         elif len(alternatives) > 0:
@@ -53,16 +64,18 @@ class CommandInput(InputLine):
     def handle_key(self, key):
         must_repaint = False
 
-        if key in [Key.TAB, "^N"] and self.completion is not None and not self.completion.is_visible:
+        if key in [Key.TAB, "^N"] and not self.completion.is_visible:
             self.update_completion()
-        elif self.completion is not None and self.completion.is_visible and self.completion.handle_key(key):
+
+        elif self.completion.is_visible and self.completion.handle_key(key):
             pass
+
         elif key in [Key.ESCAPE, "^C"]:
             self.app.execute_command('cancel-command')
-        
+
         elif key in [Key.BACKSPACE] and (self.text is None or len(self.text) == 0):
             self.app.execute_command('cancel-command')
-        
+
         elif key in [Key.UP]:
             if self.history_cursor is None:
                 self.cached_text = self.text
@@ -77,7 +90,7 @@ class CommandInput(InputLine):
                 self.text = self.candidates[self.history_cursor]
                 self.cursor = min(len(self.text), self.cursor)
                 must_repaint = True
-        
+
         elif key in [Key.DOWN] and self.history_cursor is not None:
             if self.history_cursor == len(self.candidates) - 1:
                 self.text = self.cached_text
@@ -89,9 +102,14 @@ class CommandInput(InputLine):
                 self.cursor = min(len(self.text), self.cursor)
             must_repaint = True
 
-        elif key in [Key.RETURN]:
+        elif key in [Key.RETURN] and self.text is not None:
             self.app.execute_command('cancel-command')
-            seq = shlex.split(self.text)
+            try:
+                seq = shlex.split(self.text)
+            except ValueError as exc:
+                self.app.error(str(exc))
+                seq = []
+
             if len(seq) == 0:
                 command = None
             else:
@@ -105,7 +123,8 @@ class CommandInput(InputLine):
                 else:
                     try:
                         if len(seq) > 1:
-                            expanded = sum([expand_part(self.app, part) for part in seq[1:]], start=[])
+                            expanded = sum([expand_part(self.app, part)
+                                            for part in seq[1:]], start=[])
                             self.app.execute_command(command, *expanded)
                         else:
                             self.app.execute_command(command)
@@ -123,7 +142,7 @@ class CommandInput(InputLine):
             self.history_cursor = None
             self.cached_text = None
             self.cached_cursor = None
-        
+
         else:
             text = self.text
             super().handle_key(key)
@@ -158,11 +177,10 @@ def expand_part(app, part):
     """
     if part == '%n':
         return [str(app.current_panel.selected_path.name)]
-    elif part == '%f':
+    if part == '%f':
         return [str(app.current_panel.selected_path)]
-    elif part == '%s':
+    if part == '%s':
         return [str(p) for p in app.current_panel.selected_paths]
-    elif part == '%p':
+    if part == '%p':
         return [str(app.current_panel.selected_path.parent)]
     return [part]
-

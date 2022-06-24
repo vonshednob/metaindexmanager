@@ -49,7 +49,9 @@ class DetailPanel(ListPanel):
 
     def reload(self):
         self.items = []
-        metadata = [entry.metadata for entry in self.app.cache.get(self.filepath) if entry.path == self.filepath]
+        metadata = [entry
+                    for entry in self.app.cache.get(self.filepath)
+                    if entry.path == self.filepath]
 
         if len(metadata) == 0:
             return
@@ -74,13 +76,20 @@ class DetailPanel(ListPanel):
 
             expanded = self.synonyms.get(key, [key])
             for expkey in expanded:
-                for value in metadata.getall(expkey, []):
-                    self.items.append((" "*3 + self.app.humanize(value), curses.A_NORMAL))
+                for value in metadata[expkey]:
+                    self.items.append((" "*3 + self.app.as_printable(value), curses.A_NORMAL))
 
     def do_paint_item(self, y, x, maxwidth, is_selected, item):
         text, attr = item
         self.win.addstr(y, x, " "*maxwidth)
         self.win.addstr(y, x, text[:maxwidth], attr)
+
+    def line_matches_find(self, cursor):
+        if self.items is None or self.find_text is None:
+            return False
+        if self.app.configuration.find_is_case_sensitive:
+            return self.find_text in self.items[cursor][0]
+        return self.find_text.lower() in self.items[cursor][0].lower()
 
 
 @command.registered_command

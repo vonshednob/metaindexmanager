@@ -2,8 +2,7 @@ import pathlib
 import tempfile
 import subprocess
 import string
-
-import multidict
+import os
 
 from cursedspace import ShellContext, InputLine
 
@@ -12,6 +11,7 @@ import metaindex.indexer
 import metaindex.indexers
 import metaindex.ocr
 import metaindex.stores
+from metaindex import index_files, CacheEntry
 
 from metaindexmanager import layouts
 from metaindexmanager import utils
@@ -52,6 +52,23 @@ class OpenItem(Command):
 
     def execute(self, context):
         context.panel.open_selected()
+
+
+@registered_command
+class OpenItemWith(Command):
+    """Open the selected file or folder with a user-specified program"""
+    NAME = 'open-with'
+    ACCEPT_IN = (DocPanel, FilePanel, EditorPanel)
+
+    def completion_options(self, context, *args):
+        if len(args) == 0 or len(args[0]) == 0:
+            return [p.name for p in context.application.known_programs]
+
+        return [p.name for p in context.application.known_programs
+                if args[0] in p.name]
+
+    def execute(self, context, *args):
+        context.panel.open_selected_with(list(args))
 
 
 @registered_command
@@ -136,7 +153,7 @@ class EnterCommandMode(Command):
         context.application.previous_focus = context.panel
         context.application.activate_panel(context.application.command_input)
         context.application.paint()
-        logger.debug(f"Enter command input")
+        logger.debug("Enter command input")
 
 
 @registered_command
@@ -176,7 +193,7 @@ class EditMetadataExternally(Command):
 
         # ensure there is something to edit
         if file is None:
-            logger.debug(f"No file to edit")
+            logger.debug("No file to edit")
             context.application.error("Nothing selected")
             return
 
@@ -201,7 +218,7 @@ class EditMetadataExternally(Command):
             app.error("No store set up to write into")
             return
 
-        if sidecar == file:
+        if sidecar == file or app.metaindexconf.is_sidecar_file(file):
             context.application.error("Cannot edit metadata of a file that's "
                                       "probably a metadata file")
             return
@@ -209,22 +226,23 @@ class EditMetadataExternally(Command):
         if sidecar.is_file():
             if is_collection:
                 meta = store.get_for_collection(sidecar, '')
-                meta = utils.collection_meta_as_writable(meta, sidecar.parent)
+                if file not in meta:
+                    is_collection = False
+                    meta = CacheEntry(file)
+                else:
+                    meta = meta[file]
             else:
-                meta = store.get(sidecar, '')
-                meta.popall(metaindex.shared.IS_RECURSIVE, [])
+                meta = store.get(sidecar)
+                meta.pop(metaindex.shared.IS_RECURSIVE)
 
         else:
             # get the metadata for the selected item as a dict
             results = app.cache.get(file)
             logger.debug(f"Cached metadata for {file}: {results}")
-            meta = multidict.MultiDict()
-
             if len(results) > 0:
-                for key, value in results[0][1].items():
-                    if not key.startswith('extra.'):
-                        continue
-                    meta.add(key.split('.', 1)[1], value)
+                meta = results[0]
+            else:
+                meta = CacheEntry(file)
 
         # resolve the external editor
         editor = context.application.get_text_editor(True)
@@ -245,11 +263,11 @@ class EditMetadataExternally(Command):
             fh.seek(0)
             changed = new_content != original
             if is_collection:
-                updated = store.get_for_collection(fh, '', file.parent)
-                updated = utils.collection_meta_as_writable(updated, file.parent)
+                updated = store.get_for_collection(fh, file.parent)
+                updated = updated[file.parent]
             else:
-                updated = store.get(fh, '')
-                updated.popall(metaindex.shared.IS_RECURSIVE, [])
+                updated = store.get(fh)
+                updated.pop(metaindex.shared.IS_RECURSIVE)
 
         if changed:
             store.store(updated, sidecar)
@@ -292,47 +310,6 @@ class SelectFileAndExit(Command):
 
 
 @registered_command
-class CopyPathToClipboard(Command):
-    """Copy the selected item to clipboard"""
-    NAME = 'copy'
-    ACCEPT_IN = (DocPanel, FilePanel)
-
-    def execute(self, context, clipboard=None):
-        source = context.panel
-        if source.is_busy:
-            return
-
-        context.application.clear_clipboard(clipboard)
-        for path in source.selected_paths:
-            context.application.append_to_clipboard(path, clipboard)
-
-
-@registered_command
-class AppendPathToClipboard(Command):
-    """Append the selected item path to clipboard"""
-    NAME = 'append'
-    ACCEPT_IN = (DocPanel, FilePanel)
-
-    def execute(self, context, clipboard=None):
-        source = context.panel
-        if source.is_busy:
-            return
-
-        for path in source.selected_paths:
-            context.application.append_to_clipboard(path, clipboard)
-
-
-@registered_command
-class ClearClipboard(Command):
-    """Clear the clipboard of items to copy"""
-    NAME = 'clear-clipboard'
-
-    def execute(self, context, clipboard=None):
-        context.application.clear_clipboard(clipboard)
-        context.application.info(f"Clipboard {clipboard} cleared")
-
-
-@registered_command
 class RefreshPanel(Command):
     """Refresh the current panel"""
     NAME = 'refresh'
@@ -368,10 +345,13 @@ class DeleteItem(Command):
 class BookmarkNameReader(InputLine):
     def __init__(self, application, prefix):
         height, width = application.size()
+        application.clear_info_text()
         super().__init__(application, width, (height-1, 0), prefix=prefix)
 
     def handle_key(self, key):
         self.app.activate_panel(self.app.previous_focus)
+        self.win.erase()
+        self.win.noutrefresh()
         self.destroy()
         if len(str(key)) == 1 and str(key) in string.ascii_letters:
             self.bookmark_selected(str(key))
@@ -387,8 +367,11 @@ class LoadBookmarkNameReader(BookmarkNameReader):
     def __init__(self, application):
         super().__init__(application, 'Bookmark to load: ')
 
-    def bookmark_selected(self, mark):
+    def handle_key(self, key):
         self.app.hide_key_help()
+        super().handle_key(key)
+
+    def bookmark_selected(self, mark):
         self.app.load_bookmark(mark)
 
 
@@ -537,16 +520,14 @@ class SetCommand(Command):
     NAME = 'set'
 
     def completion_options(self, context, *args):
-        text = args[0] if len(args) > 0 else ""
-        scope = ""
-        name = ""
-
         options = []
-        for group in sorted(context.application.configuration.conf.sections()):
-            for option in sorted(context.application.configuration.conf[group]):
-                full = group + "." + option
-                if full.startswith(text):
-                    options.append(group + "." + option)
+        if len(args) < 2:
+            text = args[0] if len(args) > 0 else ""
+            for group in sorted(context.application.configuration.conf.sections()):
+                for option in sorted(context.application.configuration.conf[group]):
+                    full = group + "." + option
+                    if full.startswith(text):
+                        options.append(group + "." + option)
 
         return options
 
@@ -598,7 +579,8 @@ class ClearSelection(Command):
         if context.panel.is_busy:
             return
 
-        indexes = [idx for idx, item in enumerate(context.panel.items) if item in context.panel.multi_selection]
+        indexes = [idx for idx, item in enumerate(context.panel.items)
+                   if item in context.panel.multi_selection]
         context.panel.multi_selection = []
         for index in indexes:
             context.panel.paint_item(index)
@@ -614,8 +596,39 @@ class InvertSelection(Command):
         if context.panel.is_busy:
             return
 
-        context.panel.multi_selection = [item for item in context.panel.items if item not in context.panel.multi_selection]
+        context.panel.multi_selection = [item for item in context.panel.items
+                                         if item not in context.panel.multi_selection]
         context.panel.paint()
+
+
+@simple_command("find")
+def find_command(context, *args):
+    """Find text in the current panel"""
+    if context.panel.is_busy:
+        context.application.error("Panel is currently busy")
+        return
+
+    context.panel.find(" ".join(args))
+
+
+@simple_command("find-next")
+def find_next_command(context):
+    """Find the next occurrence"""
+    if context.panel.is_busy:
+        context.appliaction.error("Panel is currently busy")
+        return
+
+    context.panel.find_next()
+
+
+@simple_command("find-prev")
+def find_previous_command(context):
+    """Find the previous occurrence"""
+    if context.panel.is_busy:
+        context.appliaction.error("Panel is currently busy")
+        return
+
+    context.panel.find_previous()
 
 
 @registered_command
@@ -648,7 +661,7 @@ class RunOCR(Command):
 
         meta = context.application.cache.get(path, False)
         if len(meta) == 0:
-            meta = multidict.MultiDict()
+            meta = CacheEntry(path)
         else:
             meta = meta[0][1]
 
@@ -676,24 +689,25 @@ class RunIndexers(Command):
             return
 
         path = context.panel.selected_path
-        context.panel.run_blocking(self.run_indexers, context, path)
+        context.panel.run_blocking(self.run_indexers, context.application, context.panel, path)
         context.application.paint(True)
 
-    def run_indexers(self, blocker, context, path):
+    @staticmethod
+    def run_indexers(blocker, application, panel, path):
         blocker.title(f"Running indexers on {path.name}")
+        logger.debug("Running indexers on %s", path.name)
 
-        item = context.panel.selected_item
+        item = panel.selected_item
 
         if path.is_dir():
-            paths = context.application.cache.find_indexable_files([path])
+            paths = application.cache.find_indexable_files([path])
         else:
             paths = [path]
 
-        results = metaindex.indexer.index_files(paths,
-                                                processes=1,
-                                                ocr_=metaindex.ocr.Dummy(),
-                                                fulltext=False,
-                                                config=context.application.metaindexconf)
+        results = index_files(paths,
+                              application.metaindexconf,
+                              ocr=metaindex.ocr.Dummy(),
+                              fulltext=False)
         if len(results) == 0:
             return
 
@@ -701,24 +715,24 @@ class RunIndexers(Command):
 
         # merge the results
         for idx, result in enumerate(results):
-            lpath, success, extra = result
+            logger.debug("index resulted in %s", result)
 
-            base = context.application.cache.get(lpath, False)
+            base = application.cache.get(result.filename)
             if len(base) == 0:
-                info = multidict.MultiDict()
+                info = CacheEntry(result.filename)
             else:
-                info = base[0][1]
+                info = base[0]
 
-            if not success:
-                logger.debug(f"Indexer did not succeed on {lpath}")
+            if not result.success:
+                logger.debug(f"Indexer did not succeed on {result.filename}")
                 continue
-            logger.debug(f"Indexer found something for {lpath}")
+            logger.debug(f"Indexer found something for {result.filename}")
 
             # extend the cached metadata with the newly indexed data
             newly_added = False
-            for key in set(extra.keys()):
-                for value in extra.getall(key):
-                    if value in info.getall(key, []):
+            for key in set(result.info.keys()):
+                for value in result.info[key]:
+                    if value in info[key]:
                         continue
                     info.add(key, value)
                     newly_added = True
@@ -727,13 +741,13 @@ class RunIndexers(Command):
                 logger.debug("Nothing new here")
                 return
 
-            context.application.cache.insert(lpath, info)
+            application.cache.insert(info)
             blocker.progress((idx+1, len(results)))
 
-        if isinstance(context.panel, (DocPanel,)):
-            context.panel.search(context.panel.query)
-            context.application.callbacks.put((context.panel,
-                                               lambda: context.panel.jump_to(item)))
-        elif isinstance(context.panel, (EditorPanel,)):
-            context.application.callbacks.put((context.panel,
-                                               lambda: context.panel.reload()))
+        if isinstance(panel, (DocPanel,)):
+            panel.search(panel.query)
+            application.callbacks.put((panel,
+                                       lambda: panel.jump_to(item[-1].path)))
+        elif isinstance(panel, (EditorPanel,)):
+            application.callbacks.put((panel,
+                                       panel.reload))

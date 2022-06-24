@@ -1,3 +1,4 @@
+import sys
 import os
 import curses
 import stat
@@ -5,14 +6,13 @@ import logging
 import shutil
 import pathlib
 import subprocess
-
-import multidict
+import datetime
+import string
+from logging.handlers import RotatingFileHandler
 
 import metaindex.shared
 import metaindex.ocr
 import metaindex.indexer
-
-from cursedspace import colors
 
 from .shared import PROGRAMNAME
 
@@ -27,7 +27,10 @@ class MetaindexmanagerLogger:
         if filename is None:
             self.handler = logging.NullHandler()
         else:
-            self.handler = logging.FileHandler(filename, encoding='utf-8')
+            self.handler = RotatingFileHandler(filename,
+                                               encoding='utf-8',
+                                               maxBytes=4096,
+                                               backupCount=1)
 
         self.logger = logging.getLogger(PROGRAMNAME)
         self.logger.propagate = False
@@ -67,6 +70,7 @@ LS_ICONS_FALLBACK = ':'.join([
     "*.pdf=", "*.ps=", "*.djvu=",
     # books
     "*.epub=", "*.mobi=", "*.azw=", "*.azw3=", "*.ebook=",
+    "*.cbz=", "*.cb7=", "*.cbr=", "*.cba=", "*.cbt=",
     # plain text like
     "*.txt=", "*.eml=", "*.markdown=", "*.md=", "*.mkd=",
     "*.conf=", "*.cnf=", "*.cfg=", "*.ini=", "*.vim=",
@@ -102,7 +106,9 @@ LS_ICONS_FALLBACK = ':'.join([
     "*.avif=", "*.webp=",
     "*.ai=", "*.psd=",
     # audio  or 
-    "*.mp3=", "*.ogg=", "*.wav=", "*.aac=", "*.flac=", "*.m4a=",
+    "*.mp3=", "*.ogg=", "*.wav=", "*.aac=", "*.flac=", "*.m4a=", "*.opus=",
+    "*.mid=", "*.midi=", "*.musicxml=", "*.mxl=",
+    "*.abc=", "*.ly=",
     # video ,  or 
     "*.avi=", "*.mpg=", "*.mp4=", "*.ogv=", "*.webm=",
     # xml-like
@@ -214,7 +220,6 @@ def parse_ls_icons():
     USERDIR_ICONS = {}
 
     # get the user defined mapping of dir [type] -> icon from $USERDIR_ICONS
-    dirname_icons = []
     xdguserdir = shutil.which('xdg-user-dir')
     home = pathlib.Path().home()
     for pair in os.getenv('USERDIR_ICONS', USERDIR_ICONS_FALLBACK).split(':'):
@@ -332,7 +337,7 @@ def get_ls_icon(path, stats=None):
                 stats = path.stat()
             except:
                 stats = None
-        if hasattr(stats, "st_mode") and (stats.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)) != 0:
+        if is_executable(path, stats):
             tests += ['ex']
         else:
             tests += ['fi']
@@ -346,37 +351,41 @@ def get_ls_icon(path, stats=None):
     return " "
 
 
-def collection_meta_as_writable(data, basepath):
-    """Change the 'data', as read from stores.get_for_collection(), to be usable for stores.store
+def is_executable(path, stats=None):
+    """Return True if the item at path is executable
 
-    basepath is the parent path of the metadata file.
-    """
-    # turn the collection_extra again into the editable plain form,
-    # i.e. restore '*', '**', and filename entries
-    for key in set(data.keys()):
-        if key == basepath:
-            nkey = '*'
-            if data[key].popall(metaindex.shared.IS_RECURSIVE) == [True]:
-                nkey = '**'
-            data[nkey] = data.pop(key)
-            key = nkey
-        else:
-            nkey = key.name
-            if isinstance(data, multidict.MultiDict):
-                specifics = data.popall(key, [])
-                if len(specifics) > 1:
-                    merged = multidict.MultiDict()
-                    for specific in specifics:
-                        merged.extend(specific)
-                    specifics = merged
-            else:
-                assert isinstance(data, dict)
-                specifics = data.pop(key)
+    Optionally provide stats if you have obtained the stats already"""
+    if stats is None:
+        try:
+            stats = path.stat()
+        except:
+            stats = None
+    return hasattr(stats, 'st_mode') and \
+           (stats.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)) != 0
 
-            data[nkey] = specifics
-            key = nkey
-        data[key].popall(metaindex.shared.IS_RECURSIVE, [])
-    return data
+
+def is_hidden(path, stats=None):
+    """Return True if the path is considered a hidden filesystem element
+
+    Optionally provide the result of stat() if you have it already"""
+    if stats is None:
+        try:
+            stats = path.stat()
+        except:
+            stats = None
+
+    on_windows = False
+    on_mac = False
+    on_linux = path.name.startswith('.')
+    if stats is not None:
+        if sys.platform in ['win32', 'cygwin'] and \
+           hasattr(stats, 'st_file_attributes') and \
+           hasattr(stat, 'FILE_ATTRIBUTE_HIDDEN'):
+            on_windows = 0 != (stats.st_file_attributes & stat.FILE_ATTRIBUTE_HIDDEN)
+        if sys.platform in ['darwin'] and hasattr(stat, 'UF_HIDDEN'):
+            on_mac = 0 != (stats.st_mode & stat.UF_HIDDEN)
+
+    return any((on_windows, on_mac, on_linux))
 
 
 def first_line(text):
@@ -395,3 +404,41 @@ def do_ocr(path, **kwargs):
     fulltext = extra.get('ocr.fulltext', '')
     return success and len(fulltext) > 0, fulltext
 
+
+def parse_duration(text):
+    """Return a datetime.timedelta from a text like 1d2h3m20s"""
+    duration = datetime.timedelta(0)
+
+    sign = 1
+    if text.startswith('-'):
+        sign = -1
+        text = text[1:]
+    elif text.startswith('+'):
+        text = text[1:]
+
+    value = ''
+    for char in text.lower():
+        if char in string.digits:
+            value += char
+        elif char == 'h' and len(value) > 0:
+            duration += datetime.timedelta(hours=int(value))
+            value = ''
+        elif char == 'm' and len(value) > 0:
+            duration += datetime.timedelta(minutes=int(value))
+            value = ''
+        elif char == 's' and len(value) > 0:
+            duration += datetime.timedelta(seconds=int(value))
+            value = ''
+        elif char == 'd' and len(value) > 0:
+            duration += datetime.timedelta(days=int(value))
+            value = ''
+        else:
+            # parse error
+            raise ValueError(f"'{char}' is not a digit nor a unit (d/h/m/s)")
+
+    if len(value) > 0:
+        duration += datetime.timedelta(minutes=int(value))
+
+    duration *= sign
+
+    return duration

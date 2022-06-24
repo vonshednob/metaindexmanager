@@ -27,7 +27,7 @@ def compile_documentation():
 
     dst = pathlib.Path('./metaindexmanager/docs')
     dst.mkdir(exist_ok=True)
-    
+
     pathlib.Path('./man').mkdir(exist_ok=True)
 
     man_metaindexmanager = None
@@ -57,9 +57,9 @@ setuptools.setup(
     description="Console UI to browse metaindex file(s).",
     long_description=long_description,
     long_description_content_type='text/markdown',
-    url="https://github.com/vonshednob/metaindexmanager",
+    url="https://vonshednob.cc/metaindexmanager",
     author="R",
-    author_email="devel+metaindexmanager@kakaomilchkuh.de",
+    author_email="contact+metaindexmanager@vonshednob.cc",
     entry_points={'console_scripts': ['metaindexmanager=metaindexmanager.main:run'],
                   'gui_scripts': []},
     packages=['metaindexmanager'],
@@ -67,7 +67,7 @@ setuptools.setup(
     data_files=[('share/man/man1', ['man/metaindexmanager.1']),
                 ('share/applications', ['extras/metaindexmanager.desktop',]),
                 ('share/doc/metaindexmanager', ['extras/mtattach.sh'])],
-    install_requires=['metaindex>=0.6.0', 'cursedspace>=1.3.1'],
+    install_requires=['metaindex>=1.3.0', 'cursedspace>=1.5.0'],
     extras_require={},
     python_requires='>=3.8',
     classifiers=['Development Status :: 3 - Alpha',

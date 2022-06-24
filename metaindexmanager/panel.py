@@ -1,8 +1,11 @@
 import threading
 import curses
+import traceback
 
-from cursedspace import ScrollPanel, Key
+from cursedspace import Key
+from cursedspace import ScrollPanel
 
+from metaindexmanager import shared
 from metaindexmanager.utils import logger
 
 
@@ -24,6 +27,31 @@ LIST_SCROLL_COMMANDS = [
 OPTION_PAGING = 'paging'
 OPTION_SCROLL_MARGIN = 'scroll-margin'
 
+_registered_panels = {}
+
+
+def register(cls):
+    """Decorator to register a panel to metaindexmanager
+
+    The panel will be identified by its ``SCOPE`` class property.
+
+    The purpose of this registration is to be used in bookmarks
+    and the ``all.default-view`` settings.
+    """
+    if hasattr(cls, 'SCOPE'):
+        assert cls.SCOPE not in _registered_panels
+        _registered_panels[cls.SCOPE] = cls
+    return cls
+
+
+def find_panel_type(name):
+    """Find a registered panel type by its name
+
+    :param name: ``SCOPE`` name of the requested panel type
+    :return: The type of the registered panel, or ``None``
+    """
+    return _registered_panels.get(name, None)
+
 
 class BlockingTask(ScrollPanel):
     INDICATOR_1 = '-\\|/'
@@ -35,6 +63,7 @@ class BlockingTask(ScrollPanel):
         self.border = ScrollPanel.BORDER_ALL
         self.target = None
         self.task = None
+        self.cancel_requested = False
         self._title = "Blocking task"
         self._changed = False
         self._progress = None
@@ -46,6 +75,9 @@ class BlockingTask(ScrollPanel):
         self.autoresize()
 
     def handle_key(self, key):
+        if key in [Key.ESCAPE, "^C"]:
+            self.cancel_requested = True
+            return True
         return False
 
     def check(self):
@@ -57,7 +89,7 @@ class BlockingTask(ScrollPanel):
             self.paint(True)
         else:
             self.paint_indicator()
-        
+
         threading.Timer(0.5, lambda: self.app.callbacks.put((self, self.check))).start()
 
         return True
@@ -65,9 +97,13 @@ class BlockingTask(ScrollPanel):
     def paint(self, clear=False):
         super().paint(clear)
 
-        height, width = self.dim
+        if self.cancel_requested:
+            self._status = "Cancelling…"
+
+        _, width = self.dim
 
         text = self._title[:width-3]
+
         self.win.addstr(1, 1, text, curses.A_BOLD)
 
         if self._progress is not None:
@@ -92,7 +128,9 @@ class BlockingTask(ScrollPanel):
         self.paint_indicator()
 
     def paint_indicator(self):
-        self.win.addstr(self._indicator_pos[0], self._indicator_pos[1], self.indicator[self.indicator_idx])
+        self.win.addstr(self._indicator_pos[0],
+                        self._indicator_pos[1],
+                        self.indicator[self.indicator_idx])
         self.indicator_idx = (self.indicator_idx + 1) % len(self.indicator)
         self.win.noutrefresh()
 
@@ -145,10 +183,12 @@ class BlockingTask(ScrollPanel):
 
     def do_run(self):
         self.app.callbacks.put((self, self.check))
-        try:
-            self.target()
-        except Exception as exc:
-            logger.error(f"Blocking task failed: {exc}")
+        if self.target is not None:
+            try:
+                self.target()
+            except Exception as exc:
+                logger.error(f"Blocking task failed: {exc}")
+                logger.debug(''.join(traceback.format_tb(exc.__traceback__)))
         self.app.callbacks.put((self, self.destroy))
 
 
@@ -158,6 +198,7 @@ class ListPanel(ScrollPanel):
         self.reload_keybindings()
         self._is_busy = threading.Lock()
         self.multi_selection = []
+        self.find_text = None
 
     def reload_keybindings(self):
         self.SCROLL_NEXT = extract_key_sequence(self.app, NEXT_ITEM)
@@ -216,12 +257,16 @@ class ListPanel(ScrollPanel):
         changed = False
 
         if name == OPTION_PAGING or name is None:
-            new_value = self.app.configuration.bool('all', OPTION_PAGING, str(self.SCROLL_PAGING))
+            new_value = self.app.configuration.bool(shared.ALL_SCOPE,
+                                                    OPTION_PAGING,
+                                                    str(self.SCROLL_PAGING))
             changed = new_value != self.SCROLL_PAGING
             self.SCROLL_PAGING = new_value
 
         if name == OPTION_SCROLL_MARGIN or name is None:
-            new_value = self.app.configuration.number('all', OPTION_SCROLL_MARGIN, str(self.SCROLL_MARGIN))
+            new_value = self.app.configuration.number(shared.ALL_SCOPE,
+                                                      OPTION_SCROLL_MARGIN,
+                                                      str(self.SCROLL_MARGIN))
             if new_value is not None and new_value >= 0:
                 changed = changed or new_value != self.SCROLL_MARGIN
                 self.SCROLL_MARGIN = new_value
@@ -230,19 +275,82 @@ class ListPanel(ScrollPanel):
             self.scroll()
             self.paint(True)
 
-    def focus(self):
-        retval = super().focus()
-        self.on_focus()
-        return retval
-
     def on_close(self):
         pass
 
     def on_focus(self):
         pass
 
+    def on_focus_lost(self):
+        pass
+
+    def filter(self, text):
+        """Filter the list of items to the one matching the filter text"""
+
+    def find(self, text):
+        """Find the first occurrence of 'text' in the items
+
+        Start searching after the current line"""
+        self.find_text = text
+        if not self.find_next():
+            self.app.info("No match found")
+
+    def line_matches_find(self, cursor):
+        """Return True if the line at cursor matches the find_text"""
+        if not isinstance(self.items[cursor], str):
+            raise RuntimeError("Cannot find in this panel")
+
+        if self.find_text is None:
+            return False
+
+        if self.app.configuration.find_is_case_sensitive:
+            return self.find_text in self.items[cursor]
+        return self.find_text.lower() in self.items[cursor].lower()
+
+    def find_next(self):
+        """Jump to the next occurrence of the find_text
+
+        Return False if no match could be found, otherwise True"""
+        if self.find_text is None:
+            return False
+
+        idx = self.cursor
+        for idx in range(1, len(self.items)):
+            pos = (self.cursor + idx) % len(self.items)
+            if self.line_matches_find(pos):
+                self.cursor = pos
+
+                must_repaint = self.scroll()
+                self.paint(must_repaint)
+                return True
+        return False
+
+    def find_previous(self):
+        """Jump to the previous occurrence of the find_text
+
+        Return False if no match could be found, otherwise True"""
+        if self.find_text is None:
+            return False
+
+        idx = self.cursor
+        for idx in range(1, len(self.items)):
+            pos = (self.cursor - idx) % len(self.items)
+            if self.line_matches_find(pos):
+                self.cursor = pos
+
+                must_repaint = self.scroll()
+                self.paint(must_repaint)
+                return True
+        return False
+
 
 def extract_key_sequence(application, commandname):
+    """Get all key sequences of this command in the 'any' scope
+
+    :param application: The application
+    :param commandname: The name of the command in question
+    :rtype: ``list[tuple[str]]``, all key identifiers
+    """
     return [keys
             for scope, keys, cmd in application.keys
-            if cmd[0] == commandname and scope == 'any']
+            if cmd[0] == commandname and scope == shared.ANY_SCOPE]

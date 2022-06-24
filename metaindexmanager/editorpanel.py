@@ -3,21 +3,23 @@ import collections
 import tempfile
 import subprocess
 
-import multidict
-
 from metaindex import shared
+from metaindex.ocr import Dummy, TesseractOCR
+from metaindex.humanizer import humanize
+from metaindex.shared import DUBLINCORE_TAGS
 import metaindex.cache
 import metaindex.indexer
 
-from cursedspace import Key, InputLine, ShellContext
+from cursedspace import Key, InputLine, ShellContext, Completion, colors
 
+from metaindexmanager import clipboard
 from metaindexmanager import command
-from metaindexmanager import utils
-from metaindexmanager.utils import logger
+from metaindexmanager.shared import DICTIONARY_SCOPE
+from metaindexmanager.utils import logger, first_line
 from metaindexmanager.panel import ListPanel
-from metaindexmanager.detailpanel import DetailPanel
 from metaindexmanager.docpanel import DocPanel
 from metaindexmanager.filepanel import FilePanel
+from metaindexmanager.detailpanel import DetailPanel
 
 
 Change = collections.namedtuple("Change", ['index', 'new_value', 'prefix', 'tag', 'old_value'])
@@ -25,17 +27,81 @@ Insert = collections.namedtuple("Insert", ['prefix', 'tag', 'value'])
 Delete = collections.namedtuple("Delete", ['index', 'prefix', 'tag', 'value'])
 GroupedChange = collections.namedtuple("GroupedChange", ['changes'])
 
-Line = collections.namedtuple("Line", ['group', 'prefix', 'tag', 'value'])
-Header = collections.namedtuple("Header", ['group', 'title', 'prefix', 'tag', 'value'], defaults=['', '', ''])
+
+class LineBase:
+    def __init__(self, group):
+        self.group = group
+
+    def comparator(self):
+        return [self.group != shared.EXTRA[:-1],
+                self.group]
+
+    def __lt__(self, other):
+        return self.comparator() < other.comparator()
+
+
+class Header(LineBase):
+    @property
+    def title(self):
+        return self.group.title()
+
+class Line(LineBase):
+    def __init__(self, group, prefix, tag, value):
+        super().__init__(group)
+        self.prefix = prefix
+        self.tag = tag
+        self.value = value
+
+    def comparator(self):
+        return super().comparator() + [self.tag.lower(), str(self.value).lower()]
+
+
+class EditorLineCompletion(Completion):
+    COLOR = colors.BLUE
+
+    def __init__(self, editorline, words):
+        super().__init__(editorline)
+        self.words = words
+
+    def update(self, y, x):
+        text = self.inputline.text[:self.inputline.cursor]
+        if text.endswith(' '):
+            text = ''
+        else:
+            text = text.split(' ')[-1]
+
+        options = [word
+                   for word in sorted(self.words, key=lambda a: str(a))
+                   if str(word).startswith(text)]
+        if len(options) == 1 and str(options[0]) == text:
+            # only available option typed out
+            self.close()
+            self.app.paint()
+        elif len(options) > 0:
+            # there are options? show them
+            self.set_alternatives(options, (y, x))
+            self.app.paint()
+        elif self.is_visible:
+            # no options, but the box is still visible? close it
+            self.close()
+            self.app.paint()
+
+    def handle_key(self, key):
+        result = super().handle_key(key)
+        if result and self.suggestions is None:
+            self.inputline.paint(True)
+        return result
 
 
 class EditorLine(InputLine):
-    def __init__(self, panel, *args, text=None, **kwargs):
-        y = panel.pos[0] + panel.cursor - panel.offset + 1
-        x = panel.pos[1] + panel.columns[0] + 1
+    def __init__(self, panel, text=None, suggestions=None):
         if text is None:
-            text = panel.selected_line.value or ''
-        super().__init__(panel.app, panel.columns[1], (y, x), text=text, background='░') # background='░.')
+            text = panel.app.as_printable(panel.selected_line.value, None)
+        super().__init__(panel.app,
+                         panel.columns[1],
+                         (1, 1),
+                         text=text,
+                         background='░')
 
         self.item = panel.selected_line
         self.parent = panel
@@ -43,17 +109,40 @@ class EditorLine(InputLine):
         self.app.current_panel = self
         self.original_text = self.text
 
+        self.reposition()
+
+        if suggestions is not None and len(suggestions) > 0:
+            self.completion = EditorLineCompletion(self, suggestions)
+
         logger.debug(f"Enter tag edit mode for {self.item} (text: '{text}')")
 
+    def reposition(self):
+        y, x, _, _ = self.parent.content_area()
+        y += self.parent.pos[0] + self.parent.cursor - self.parent.offset
+        x += self.parent.pos[1] + self.parent.columns[0]
+        self.move(y, x)
+
     def handle_key(self, key):
-        if key in [Key.ESCAPE, "^C"]:
+        if key in [Key.TAB, "^N"] and \
+           (self.completion is None or not self.completion.is_visible):
+            self.update_completion()
+
+        elif self.completion is not None and \
+             self.completion.is_visible and \
+             self.completion.handle_key(key):
+            pass
+
+        elif key in [Key.ESCAPE, "^C"]:
             self.destroy()
 
         elif key in [Key.RETURN, "^S"]:
             self.destroy()
             if self.text != self.original_text:
                 idx = self.parent.items.index(self.item)
-                self.parent.changed(Change(idx, self.text,
+                humanized = humanize(self.item.prefix + '.' + self.item.tag,
+                                     self.text)
+                self.parent.changed(Change(idx,
+                                           shared.MetadataValue(self.text, humanized),
                                            self.item.prefix,
                                            self.item.tag,
                                            self.item.value))
@@ -75,6 +164,9 @@ class EditorPanel(ListPanel):
 
     CONFIG_ICON_MULTILINE = 'multiline-indicator'
     CONFIG_ICON_CUTOFF = 'cutoff-indicator'
+    CONFIG_NO_COMPLETION = 'no-completion'
+    CONFIG_TAGS = 'tags'
+    CONFIG_TAGS_DEFAULT = ','.join({'*'} | DUBLINCORE_TAGS)
 
     def __init__(self, filepath, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -88,13 +180,20 @@ class EditorPanel(ListPanel):
         # list of items directly after reload
         self.unchanged_items = []
         self.editor = None
-        self.metadata = multidict.MultiDict()
+        self.metadata = shared.CacheEntry(filepath)
+
+        self.auto_index_if_not_in_cache = True
 
         self._multiline_icon = ' '
         self._cutoff_icon = ' '
+        self.suggested_tags = set()
+        self._no_completion = set()
         self.configuration_changed()
 
         self.reload()
+        # signal to self.paint() that we have to recalculate the columns,
+        # as the panel will not have the correct size just now
+        self.columns = [0, 0]
         self.cursor = 1
 
     @property
@@ -110,15 +209,45 @@ class EditorPanel(ListPanel):
         return str(self.item)
 
     @property
+    def selected_items(self):
+        if len(self.multi_selection) == 0:
+            line = self.selected_line
+            if isinstance(line, Line):
+                return [line]
+            return []
+        return self.multi_selection
+
+    @property
     def selected_line(self):
         if 0 <= self.cursor < len(self.items):
             return self.items[self.cursor]
         return None
 
+    def on_copy(self, item):
+        return clipboard.ClipboardItem(item, self)
+
+    def on_paste(self, items, behaviour):
+        if self.is_busy:
+            raise RuntimeError("Cannot paste right now, editor is busy")
+
+        # TODO - make use of the 'behaviour' flag
+        changes = [Insert(shared.EXTRA[:-1], item.data.tag, item.data.value)
+                   for item in items if isinstance(item.data, Line)]
+        if len(changes) == 0:
+            raise RuntimeError("Cannot paste this here")
+
+        grouped = GroupedChange(changes)
+        self.changed(grouped)
+
     def open_selected(self):
         if self.item is None:
             return
         self.app.open_file(self.item)
+
+    def open_selected_with(self, cmd):
+        if self.item is None:
+            return
+        self.app.open_with(self.item, cmd)
 
     def changed(self, change):
         logger.debug(f"Added change to stack: {change}")
@@ -129,16 +258,22 @@ class EditorPanel(ListPanel):
         self.rebuild_columns()
         self.scroll()
         self.paint(True)
+        self.app.paint_focus_bar()
 
     def paint(self, clear=False):
+        if self.columns == [0, 0]:
+            self.rebuild_columns()
         super().paint(clear)
 
-        if self.change_ptr > 0:
+        if self.change_ptr > 0 and (self.border & self.BORDER_TOP) > 0:
             self.win.addstr(0, 1, " Modified ")
             self.win.noutrefresh()
 
     def title(self):
-        return str(self.item)
+        title = str(self.item)
+        if self.change_ptr > 0:
+            title = "[Modified] " + title
+        return title
 
     def focus(self):
         y, x = super().focus()
@@ -155,7 +290,7 @@ class EditorPanel(ListPanel):
             return
         original = item.value
         new_content = original
-        can_edit = item.prefix == 'extra'
+        can_edit = item.prefix == shared.EXTRA[:-1]
 
         editor = self.app.get_text_editor(True)
         if editor is None:
@@ -173,22 +308,50 @@ class EditorPanel(ListPanel):
                 fh.flush()
                 fh.seek(0)
                 new_content = fh.read()
+                humanized = humanize(item.prefix + '.' + item.tag, new_content)
+                new_content = shared.MetadataValue(new_content, humanized)
         logger.debug(f"Can change? {can_edit} -- has changes? {new_content != original}")
 
         if can_edit and new_content != original:
             self.changed(Change(self.cursor, new_content, item.prefix, item.tag, original))
 
     def start_edit(self, text=None):
+        if self.selected_line is None:
+            return
+
         logger.debug(f"start editing {self.selected_line}")
         if self.editor is not None:
             self.editor.destroy()
             del self.editor
 
-        if (text is not None and '\n' in text) or (text is None and '\n' in self.selected_line.value):
+        if (text is not None and '\n' in text) or \
+           (text is None and '\n' in str(self.selected_line.value.raw_value)):
             self.multiline_edit()
         else:
-            self.editor = EditorLine(self, text=text)
+            self._create_editor(text)
             self.app.paint(True)
+
+    def _create_editor(self, text):
+        if self.selected_line is None:
+            return
+        words = None
+        if self.selected_line.tag not in self._no_completion:
+            tag = self.selected_line.prefix + "." + self.selected_line.tag
+            words = set(self.app.configuration.list(DICTIONARY_SCOPE,
+                                                    self.selected_line.tag,
+                                                    ''))
+            use_all_values = len(words) == 0
+            if len(words) > 0:
+                if '*' in words:
+                    use_all_values = True
+                    words.remove('*')
+            if use_all_values:
+                words |= set(sum([[str(v.raw_value) for v in result[tag]]
+                                  for result in self.app.cache.find(tag + "?")],
+                                 start=[]))
+        self.editor = EditorLine(self,
+                                 text=text,
+                                 suggestions=words)
 
     def cancel_edit(self):
         if self.editor is None:
@@ -201,6 +364,14 @@ class EditorPanel(ListPanel):
     def resize(self, *args):
         super().resize(*args)
         self.rebuild_columns()
+        self.scroll()
+        if self.editor is not None:
+            self.editor.resize(self.columns[1])
+
+    def move(self, *args):
+        super().move(*args)
+        if self.editor is not None:
+            self.editor.reposition()
 
     def reset(self):
         self.changes = []
@@ -213,94 +384,7 @@ class EditorPanel(ListPanel):
         if blocker is not None:
             blocker.title(f"Saving changes to {self.selected_path.name}")
 
-        # Read in the current sidecar file, if it exists
-        collection_extra = None
-        sidecar_file, is_collection, store = \
-            self.app.metaindexconf.resolve_sidecar_for(self.selected_path)
-
-        if sidecar_file is None:
-            self.app.error("No usable metadata storage available")
-            return
-
-        if sidecar_file.exists():
-            if is_collection:
-                collection_extra = store.get_for_collection(sidecar_file, prefix='')
-
-                collection_extra = \
-                    utils.collection_meta_as_writable(collection_extra, sidecar_file.parent)
-                logger.debug("Read collection metadata: %s", collection_extra)
-
-                if self.selected_path.name in collection_extra:
-                    extra = collection_extra.pop(self.selected_path.name)
-                else:
-                    extra = multidict.MultiDict()
-                logger.debug("Extra for %s is: %s", self.selected_path.name, extra)
-
-            else:
-                extra = store.get(sidecar_file, prefix='')
-                # remove control data
-                extra.popall(shared.IS_RECURSIVE, [])
-        else:
-            if is_collection:
-                collection_extra = multidict.MultiDict()
-            extra = multidict.MultiDict()
-
-        # apply all changes to the extra metadata
-        for change in self.expand_changes():
-            logger.debug(f" ... processing {change}")
-            prefix = ''
-            if change.prefix != 'extra':
-                prefix = change.prefix + '.'
-
-            if isinstance(change, Change):
-                values = extra.popall(prefix + change.tag, None)
-                if values is None:
-                    values = []
-
-                applied = False
-                for value in values:
-                    if value == change.old_value and not applied:
-                        extra.add(prefix + change.tag, change.new_value)
-                        applied = True
-                    else:
-                        extra.add(prefix + change.tag, value)
-
-                if not applied:
-                    logger.info(f"Change to {prefix + change.tag} is actually an insert because of different sources")
-                    extra.add(prefix + change.tag, change.new_value)
-
-            elif isinstance(change, Insert):
-                extra.add(prefix + change.tag, change.value)
-            
-            elif isinstance(change, Delete):
-                values = extra.popall(prefix + change.tag, None)
-                if values is None:
-                    logger.warning(f"Skipping deletion of {prefix + change.tag}: not found")
-                    continue
-                if change.value in values:
-                    values.remove(change.value)
-                for value in values:
-                    extra.add(prefix + change.tag, value)
-
-        # 'store' will not remove the 'extra.' prefix per tag,
-        # so we have to do that here
-        for key in set(extra.keys()):
-            if not key.startswith('extra.'):
-                continue
-            values = extra.popall(key)
-            _, key = key.split('.', 1)
-            for value in values:
-                extra.add(key, value)
-        logger.debug(f"Writing new metadata: {extra}")
-
-        # save the extra metadata to the sidecar file
-        if is_collection:
-            assert collection_extra is not None
-            collection_extra[self.selected_path.name] = extra
-            logger.debug(f"Updating collection sidecar to {collection_extra}")
-            store.store(collection_extra, sidecar_file)
-        else:
-            store.store(extra, sidecar_file)
+        self._apply_changes_to(self.selected_path)
 
         # reload the cache
         with ShellContext(self.app.screen):
@@ -311,40 +395,142 @@ class EditorPanel(ListPanel):
         # reset
         self.reset()
 
+    def _apply_changes_to(self, targetfile):
+        # Read in the current sidecar file, if it exists
+        collection_extra = None
+        sidecar_file, is_collection, store = \
+            self.app.metaindexconf.resolve_sidecar_for(targetfile)
+
+        if sidecar_file is None:
+            self.app.error("No usable metadata storage available")
+            return
+
+        if sidecar_file.exists():
+            if is_collection:
+                collection_extra = store.get_for_collection(sidecar_file)
+
+                logger.debug("Read collection metadata: %s", collection_extra)
+
+                if self.selected_path in collection_extra:
+                    extra = collection_extra.pop(targetfile)
+                    del extra[shared.IS_RECURSIVE]
+                else:
+                    extra = shared.CacheEntry(self.selected_path)
+                logger.debug("Extra for %s is: %s", targetfile.name, extra)
+
+            else:
+                logger.debug(" ... reading metadata from %s", sidecar_file)
+                extra = store.get(sidecar_file)
+                extra.path = targetfile
+                # remove control data
+                del extra[shared.IS_RECURSIVE]
+        else:
+            logger.debug(" ... no sidecar file there yet")
+            if is_collection:
+                collection_extra = {}
+            extra = shared.CacheEntry(targetfile)
+
+        logger.debug(f" ... {extra.metadata}")
+
+        # apply all changes to the extra metadata
+        for change in self.expand_changes():
+            logger.debug(f" ... processing {change}")
+            prefix = shared.EXTRA
+            if change.prefix != prefix[:-1]:
+                prefix = change.prefix + '.'
+
+            if isinstance(change, Change):
+                values = extra.pop(prefix + change.tag)
+
+                applied = False
+                for value in values:
+                    if value == change.old_value and not applied:
+                        extra.add(prefix + change.tag, change.new_value)
+                        applied = True
+                    else:
+                        extra.add(prefix + change.tag, value)
+
+                if not applied:
+                    logger.info("Change to %s is actually an insert because of different sources",
+                                prefix+change.tag)
+                    extra.add(prefix + change.tag, change.new_value)
+
+            elif isinstance(change, Insert):
+                extra.add(prefix + change.tag, change.value)
+
+            elif isinstance(change, Delete):
+                values = extra.pop(prefix + change.tag)
+                if len(values) == 0:
+                    logger.warning(f"Skipping deletion of {prefix + change.tag}: not found")
+                    continue
+                if change.value in values:
+                    values.remove(change.value)
+                for value in values:
+                    extra.add(prefix + change.tag, value)
+
+        # 'store' will not remove the 'extra.' prefix per tag,
+        # so we have to do that here
+        logger.debug("Writing new metadata: %s to %s",
+                     extra.metadata, sidecar_file)
+
+        # save the extra metadata to the sidecar file
+        if is_collection:
+            assert collection_extra is not None
+            collection_extra[targetfile.name] = extra
+            logger.debug(f"Updating collection sidecar to {collection_extra}")
+            logger.debug("%s", extra.metadata)
+            store.store(list(collection_extra.values()), sidecar_file)
+        else:
+            store.store(extra, sidecar_file)
+
     def reload(self):
         logger.debug("Reloading %s", self.item)
-        metadata = [entry.metadata
+
+        metadata = [entry
                     for entry in self.app.cache.get(self.item)
                     if entry.path == self.item]
 
+        if len(metadata) == 0 and self.auto_index_if_not_in_cache:
+            self.auto_index_if_not_in_cache = False
+            index_cmd = command.resolve_command('index')
+            if index_cmd is not None:
+                self.run_blocking(index_cmd.run_indexers, self.app, self, self.item)
+                return
+
         if len(metadata) == 0:
-            self.metadata = multidict.MultiDict({'filename': str(self.selected_path.name)})
+            self.metadata = shared.CacheEntry(self.item)
         else:
             self.metadata = metadata[0]
+
+        logger.debug("Reload: %s (%s)", self.metadata.keys(), self.app.cache)
 
         self.rebuild_items()
         self.rebuild_columns()
 
     def rebuild_columns(self):
         if len(self.items) > 1:
-            self.columns = [max([1 if isinstance(row, Header) else len(str(row.tag))+self.SPACING
-                                 for row in self.items]), 0]
-            self.columns[1] = self.dim[1] - self.columns[0] - 2
+            labelwidth = max([len(str(row.tag)) + self.SPACING
+                              for row in self.items
+                              if not isinstance(row, Header)])
+            labelwidth = min(labelwidth, self.dim[1]//3)
+            self.columns = [labelwidth,
+                            self.dim[1] - labelwidth - 2]
         else:
-            half_w = self.dim[1]//2
-            self.columns = [half_w, self.dim[1] - half_w]
+            labelwidth = self.dim[1]//3
+            self.columns = [labelwidth, self.dim[1] - labelwidth - 2]
+        logger.debug(f"maxwidth: {self.dim[1]}, columns: {self.columns}")
 
     def rebuild_items(self):
         self.items = []
         self.unchanged_items = []
 
         if len(self.metadata) == 0:
-            self.unchanged_items = []
             self.cursor = 0
             return
 
         keys = list(set(self.metadata.keys()))
-        keys.sort(key=lambda k: [not k.startswith('extra.'), '.' in k, k.lower()])
+        keys.sort(key=lambda k: [not k.startswith(shared.EXTRA), '.' in k, k.lower()])
+        logger.debug("editor uses these keys: %s", keys)
 
         # prepare the unchanged items
         for key in keys:
@@ -352,7 +538,8 @@ class EditorPanel(ListPanel):
             prefix = 'general'
             if '.' in key:
                 prefix, displaykey = key.split('.', 1)
-            for value in self.metadata.getall(key, []):
+            for value in self.metadata[key]:
+                logger.debug(" ... adding %s: %s", key, value)
                 self.unchanged_items.append(Line(prefix, prefix, displaykey, value))
 
         # apply all changes in order to the point where we are
@@ -373,22 +560,22 @@ class EditorPanel(ListPanel):
                 self.items = self.items[:change.index] + self.items[change.index+1:]
 
             self.items = [i for i in self.items if isinstance(i, Line)]
-            self.items += [Header(g, g.title())
-                           for g in set([i.group for i in self.items])]
+            self.items += [Header(g)
+                           for g in {i.group for i in self.items}]
 
-            self.items.sort(key=lambda k: [k.group != 'extra',
-                                           k.group,
-                                           isinstance(k, Line),
-                                           k.tag.lower(),
-                                           self.app.humanize(k.value).lower()])
+            self.items.sort()
 
     def do_paint_item(self, y, x, maxwidth, is_selected, item):
         if isinstance(item, Header):
-            self.win.addstr(y, x, item.title[:self.dim[1]-x-2], curses.A_BOLD)
+            self.win.addstr(y, x, " "*(self.content_area()[3]-1))
+            self.win.addstr(y, x, item.title[:self.columns[0]], curses.A_BOLD)
         else:
             for colidx, text in enumerate([item.tag, item.value]):
                 self.win.addstr(y, x, " "*self.columns[colidx])
-                maxlen = self.dim[1]-x-2
+                # maxlen = self.dim[1]-x-2
+                maxlen = self.columns[colidx]
+                if colidx == 0:
+                    maxlen -= self.SPACING
 
                 if text is None:
                     text = ''
@@ -396,11 +583,11 @@ class EditorPanel(ListPanel):
                     self.editor.paint()
                 else:
                     # make it a human-readable string
-                    text = self.app.humanize(text)
+                    text = self.app.as_printable(text)
 
                     # multi-line is special
                     is_multiline = '\r' in text or '\n' in text
-                    text = utils.first_line(text)
+                    text = first_line(text)
                     if is_multiline:
                         text += ' ' + self._multiline_icon
 
@@ -422,14 +609,30 @@ class EditorPanel(ListPanel):
         changed = False
 
         if name is None or name == self.CONFIG_ICON_MULTILINE:
-            new_value = self.app.configuration.get(self.SCOPE, self.CONFIG_ICON_MULTILINE, '…')
+            new_value = self.app.configuration.get(self.SCOPE,
+                                                   self.CONFIG_ICON_MULTILINE,
+                                                   '…')
             changed = self._multiline_icon != new_value
             self._multiline_icon = new_value
 
         if name is None or name == self.CONFIG_ICON_CUTOFF:
-            new_value = self.app.configuration.get(self.SCOPE, self.CONFIG_ICON_CUTOFF, '→')
+            new_value = self.app.configuration.get(self.SCOPE,
+                                                   self.CONFIG_ICON_CUTOFF,
+                                                   '→')
             changed = self._multiline_icon != new_value
             self._cutoff_icon = new_value
+
+        if name is None or name == self.CONFIG_NO_COMPLETION:
+            new_value = self.app.configuration.list(self.SCOPE,
+                                                    self.CONFIG_NO_COMPLETION,
+                                                    'title')
+            self._no_completion = set(new_value)
+
+        if name is None or name == self.CONFIG_TAGS:
+            new_values = set(self.app.configuration.list(self.SCOPE,
+                                                         self.CONFIG_TAGS,
+                                                         self.CONFIG_TAGS_DEFAULT))
+            self.suggested_tags = new_values
 
         if changed:
             if self.win is not None:
@@ -440,12 +643,12 @@ class EditorPanel(ListPanel):
         if self.editor is not None:
             self.cancel_edit()
 
-        self.changed(Insert('extra', name, ''))
+        self.changed(Insert(shared.EXTRA[:-1], name, shared.MetadataValue('')))
 
         for nr, item in enumerate(self.items):
             if not isinstance(item, Line):
                 continue
-            if item.prefix == 'extra' and item.tag == name and item.value == '':
+            if item.prefix == shared.EXTRA[:-1] and item.tag == name and item.value == '':
                 self.cursor = nr
         self.scroll()
 
@@ -521,8 +724,9 @@ class EnterEditMode(command.Command):
         if not isinstance(item, Line):
             return
 
-        if item.prefix == 'extra' or \
-           (isinstance(item.value, str) and ('\n' in item.value or '\r' in item.value)):
+        text = str(item.value.raw_value)
+        if item.prefix == shared.EXTRA[:-1] or \
+           ('\n' in text or '\r' in text):
             context.panel.start_edit()
 
 
@@ -544,10 +748,12 @@ class AddTagCommand(command.Command):
 
     def completion_options(self, context, *args):
         text = "" if len(args) == 0 else args[0]
-        keys = {key.split('.', 1)[1]
-                for key in context.application.cache.keys()
-                if key.startswith('extra.')}
-        keys |= shared.DUBLINCORE_TAGS
+        keys = context.application.previous_focus.suggested_tags.copy()
+        if '*' in keys:
+            keys.remove('*')
+            keys |= {key.split('.', 1)[1]
+                     for key in context.application.cache.keys()
+                     if key.startswith(shared.EXTRA)}
         return list(key for key in sorted(keys) if key.startswith(text))
 
     def execute(self, context, name=None):
@@ -571,7 +777,7 @@ class AddValueForAttribute(command.Command):
             return
         item = context.panel.selected_line
 
-        if not isinstance(item, Line) or item.prefix != 'extra':
+        if not isinstance(item, Line) or item.prefix != shared.EXTRA[:-1]:
             return
 
         context.panel.add_tag(item.tag)
@@ -588,7 +794,7 @@ class ReplaceValueForAttribute(command.Command):
             return
         item = context.panel.selected_line
 
-        if not isinstance(item, Line) or item.prefix != 'extra':
+        if not isinstance(item, Line) or item.prefix != shared.EXTRA[:-1]:
             return
 
         context.panel.start_edit(text='')
@@ -608,7 +814,7 @@ class RemoveAttribute(command.Command):
         if isinstance(item, Header):
             context.application.error("Selected field cannot be deleted")
             return
-        if item.prefix != 'extra':
+        if item.prefix != shared.EXTRA[:-1]:
             # TODO support the null override of values
             context.application.error("Selected field cannot be deleted")
             return
@@ -679,58 +885,6 @@ class UndoAllChanges(command.Command):
         context.panel.undo()
 
 
-@command.simple_command("copy-tag", (EditorPanel,))
-def copy_tag_command(context, clipboard=None):
-    """Copy the selected tag and value to clipboard"""
-    source = context.panel
-    if source.is_busy:
-        return
-
-    context.application.clear_clipboard(clipboard)
-
-    line = source.selected_line
-
-    if line is None or isinstance(line, Header):
-        return
-
-    context.application.append_to_clipboard((line,), clipboard)
-
-
-@command.simple_command("copy-append-tag", (EditorPanel,))
-def copy_append_tag_command(context, clipboard=None):
-    """Add the selected tag and value to clipboard"""
-    source = context.panel
-    if source.is_busy:
-        return
-
-    line = source.selected_line
-
-    if line is None or isinstance(line, Header):
-        return
-
-    context.application.append_to_clipboard((line,), clipboard)
-
-
-@command.simple_command("paste-tag", (EditorPanel,))
-def paste_tag_command(context, clipboard=None):
-    """Paste tag and value from clipboard"""
-    target = context.panel
-    if target.is_busy:
-        return
-
-    content = context.application.get_clipboard_content(clipboard)
-    if content is None:
-        return
-
-    items = [item for item in content if isinstance(item, (Line,))]
-    if len(items) == 0:
-        return
-
-    changes = [Insert('extra', line.tag, line.value) for line in items]
-    grouped = GroupedChange(changes)
-    target.changed(grouped)
-
-
 @command.registered_command
 class RunRules(command.Command):
     """Run tag rules on this document"""
@@ -754,7 +908,7 @@ class RunRules(command.Command):
 
         base = context.application.cache.get(path, False)
         if len(base) == 0:
-            info = metaindex.cache.Cache.Entry(path)
+            info = shared.CacheEntry(path)
         else:
             info = base[0]
 
@@ -764,46 +918,44 @@ class RunRules(command.Command):
             logger.debug(f"No fulltext available, running indexer on {path}")
             results = metaindex.indexer.index_files([path],
                                                     1,
-                                                    metaindex.ocr.TesseractOCR(True),
+                                                    TesseractOCR(True),
                                                     True,
                                                     context.application.metaindexconf)
             if len(results) == 0:
                 logger.debug("Indexers returned no results")
                 return
-            _, success, base = results[0]
-
-            info = metaindex.cache.Cache.Entry(path, base, shared.get_last_modified(path))
+            info = results[0].info
+            info.ensure_last_modified()
 
         else:
             # there is some fulltext, just rerun the rules
             logger.debug(f"Fulltext is already here: {len(fulltext)}")
 
-            cache = metaindex.indexer.IndexerCache(metaindex.ocr.Dummy(),
-                                                   False,
-                                                   context.application.metaindexconf,
-                                                   {},
-                                                   info)
-            indexer = metaindex.indexer.get('rule-based')(cache)
-            success, extra = indexer.run(path, info.metadata.copy(), info)
+            runner = metaindex.indexer.IndexerRunner(context.application.metaindexconf,
+                                                     ocr=Dummy(),
+                                                     fulltext=False,
+                                                     base_info=info)
+            indexer = runner.get('rule-based')
+            result = indexer.run(path, info.copy(), info)
 
-            if not success:
-                logger.debug(f"Indexer did not succeed")
+            if not result.success:
+                logger.debug("Indexer did not succeed")
                 return
 
             # extend the cached metadata with the newly indexed data
             new_info = False
-            for key in set(extra.keys()):
-                for value in extra.getall(key):
-                    if value in info.metadata.getall(key, []):
+            for key in set(result.info.keys()):
+                for value in result.info[key]:
+                    if value in info[key]:
                         continue
-                    info.metadata.add(key, value)
+                    info.add(key, value)
                     new_info = True
 
             if not new_info:
                 logger.debug("Nothing new here")
                 return
 
-        context.application.cache.insert(path, info.metadata)
+        context.application.cache.insert(info)
 
         context.application.callbacks.put((context.panel,
                                            context.panel.reload))

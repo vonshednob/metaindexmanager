@@ -11,7 +11,9 @@ import pathlib
 import traceback
 import importlib
 import queue
+import threading
 import configparser
+import urllib.request
 
 import metaindex.configuration
 import metaindex.logger
@@ -29,9 +31,10 @@ import metaindexmanager.commands as _
 import metaindexmanager.command as _
 from . import layouts
 from . import utils
+from . import version
+from . import shared
 from .utils import logger
-from .panel import LIST_SCROLL_COMMANDS
-from .shared import ANY_SCOPE, ALL_SCOPE, PROGRAMNAME
+from .panel import LIST_SCROLL_COMMANDS, find_panel_type
 from .command import resolve_command, Command
 from .docpanel import DocPanel
 from .filepanel import FilePanel
@@ -39,15 +42,17 @@ from .detailpanel import DetailPanel as _
 from .commandinput import CommandInput, expand_part
 from .keyhelppanel import KeyHelpPanel
 from .editorpanel import EditorPanel
+from .helppanel import HelpPanel
+from .clipboard import Clipboard
 
 
-CONFIGPATH = metaindex.configuration.HOME / ".config" / PROGRAMNAME
-DATAPATH = metaindex.configuration.HOME / ".local" / "share" / PROGRAMNAME
+CONFIGPATH = metaindex.configuration.HOME / ".config" / shared.PROGRAMNAME
+DATAPATH = metaindex.configuration.HOME / ".local" / "share" / shared.PROGRAMNAME
 
 try:
     from xdg import BaseDirectory
-    DATAPATH = pathlib.Path(BaseDirectory.save_data_path(PROGRAMNAME) or DATAPATH)
-    CONFIGPATH = pathlib.Path(BaseDirectory.save_config_path(PROGRAMNAME) or CONFIGPATH)
+    DATAPATH = pathlib.Path(BaseDirectory.save_data_path(shared.PROGRAMNAME) or DATAPATH)
+    CONFIGPATH = pathlib.Path(BaseDirectory.save_config_path(shared.PROGRAMNAME) or CONFIGPATH)
 except ImportError:
     BaseDirectory = None
 
@@ -62,6 +67,8 @@ DEFAULT_OPENER = 'xdg-open'
 PREF_EXT_EDITOR = 'editor'
 PREF_HIST_SIZE = 'history-size'
 DEFAULT_HIST_SIZE = '1000'
+PREF_INFO_TIMEOUT = 'info-timeout'
+DEFAULT_INFO_TIMEOUT = '10s'
 
 
 class Context:
@@ -85,7 +92,7 @@ class YesNoConfirmation(InputLine):
                 self.callback()
             try:
                 self.win.addstr(0, 0, " "*self.dim[1])
-            except:
+            except curses.error:
                 pass
             self.win.noutrefresh()
             self.destroy()
@@ -96,9 +103,15 @@ class YesNoConfirmation(InputLine):
             super().handle_key(key)
 
 
-class Application(cursedspace.Application):
-    DEFAULT_CLIPBOARD = ''
+class MetaIndexManagerConfiguration(metaindex.configuration.BaseConfiguration):
+    @property
+    def find_is_case_sensitive(self):
+        return self.bool(shared.ALL_SCOPE,
+                         shared.PREF_FIND_CASE_SENSITIVE,
+                         shared.DEFAULT_FIND_CASE_SENSITIVE)
 
+
+class Application(cursedspace.Application):
     def __init__(self, args):
         super().__init__()
         # key definition is quirky:
@@ -110,22 +123,26 @@ class Application(cursedspace.Application):
         # - ':command param1', command to be filled into the command line and
         #    the user has to complete it
         self.keys = [
-            (ANY_SCOPE, ('q', ), ('close',)),
-            (ANY_SCOPE, ('X', ), ('quit',)),
+            (shared.ANY_SCOPE, ('q', ), ('close',)),
+            (shared.ANY_SCOPE, ('X', ), ('quit',)),
+            (shared.ANY_SCOPE, ('?', ), ('help',)),
+            (shared.ANY_SCOPE, ('<F1>', ), ('help',)),
             (FilePanel.SCOPE, (Key.RIGHT,), ('open',)),
+            (FilePanel.SCOPE, ('O',), (':open-with',)),
             (DocPanel.SCOPE, (Key.RIGHT,), ('open',)),
+            (FilePanel.SCOPE, ('O',), (':open-with',)),
             (EditorPanel.SCOPE, (Key.RIGHT,), ('open',)),
+            (FilePanel.SCOPE, ('O',), (':open-with',)),
             (FilePanel.SCOPE, (Key.LEFT,), ('go-to-parent',)),
-            (ANY_SCOPE, (Key.TAB, ), ('next-panel',)),
-            (ANY_SCOPE, ('g', 'n', 'f'), ('new-file-panel',)),
-            (ANY_SCOPE, ('g', 'n', 'd'), ('new-documents-panel',)),
-            (ANY_SCOPE, ('g', 'p'), ('::focus',)),
-            (ANY_SCOPE, ('g', 't'), ('next-panel',)),
-            (ANY_SCOPE, ('g', 'T'), ('previous-panel',)),
-            (ANY_SCOPE, ('g', 'l'), ('go-to-location',)),
+            (shared.ANY_SCOPE, (Key.TAB, ), ('next-panel',)),
+            (shared.ANY_SCOPE, ('g', 'n', 'f'), ('new-file-panel',)),
+            (shared.ANY_SCOPE, ('g', 'n', 'd'), ('new-documents-panel',)),
+            (shared.ANY_SCOPE, ('g', 'p'), ('::focus',)),
+            (shared.ANY_SCOPE, ('g', 't'), ('next-panel',)),
+            (shared.ANY_SCOPE, ('g', 'T'), ('previous-panel',)),
+            (shared.ANY_SCOPE, ('g', 'l'), ('go-to-location',)),
             (DocPanel.SCOPE, ('g', 's'), (':search',)),
             (DocPanel.SCOPE, (Key.F3, ), (':search',)),
-            (DocPanel.SCOPE, ('/', ), (':search',)),
             (FilePanel.SCOPE, ('g', 'h'), ('::cd ~', "Go home")),
             (FilePanel.SCOPE, ('g', 'd'), ('details',)),
             (DocPanel.SCOPE, ('g', 'd'), ('details',)),
@@ -133,38 +150,50 @@ class Application(cursedspace.Application):
             (FilePanel.SCOPE, ('d', 'D'), ('rm',)),
             (FilePanel.SCOPE, ('a',), (':rename %n',)),
             (FilePanel.SCOPE, ('y', 'y'), ('copy',)),
+            (FilePanel.SCOPE, ('d', 'd'), ('cut',)),
             (FilePanel.SCOPE, ('y', 'a'), ('append',)),
+            (FilePanel.SCOPE, ('d', 'a'), ('cut-append',)),
+            (FilePanel.SCOPE, ('p', 'p'), ('paste',)),
+            (FilePanel.SCOPE, ('p', 'o'), ('paste-overwrite',)),
+            (FilePanel.SCOPE, ('p', 'a'), ('paste-append',)),
             (FilePanel.SCOPE, ('!', ), (':shell',)),
             (DocPanel.SCOPE, ('y', 'y'), ('copy',)),
             (DocPanel.SCOPE, ('y', 'a'), ('append',)),
-            (EditorPanel.SCOPE, ('y', 'y'), ('copy-tag',)),
-            (EditorPanel.SCOPE, ('y', 'a'), ('copy-append-tag',)),
-            (EditorPanel.SCOPE, ('p', 'p'), ('paste-tag',)),
-            (EditorPanel.SCOPE, ('p', 'P'), ('paste-tag',)),
-            (ANY_SCOPE, ('y', '0'), ('clear-clipboard',)),
+            (EditorPanel.SCOPE, ('y', 'y'), ('copy',)),
+            (EditorPanel.SCOPE, ('y', 'a'), ('append',)),
+            (EditorPanel.SCOPE, ('p', 'p'), ('paste',)),
+            (shared.ANY_SCOPE, ('y', '0'), ('clear-clipboard',)),
             (FilePanel.SCOPE, ('z', 'h'), ('toggle-hidden',)),
-            (ANY_SCOPE, ('z', 's'), ('::layout horizontal', 'Split layout')),
-            (ANY_SCOPE, ('z', 't'), ('::layout tabbed', 'Tabbed layout')),
-            (ANY_SCOPE, (':', ), ('enter-command',)),
-            (ANY_SCOPE, ('^L', ), ('repaint',)),
+            (FilePanel.SCOPE, ('z', 'm'), ('toggle-sidecar',)),
+            (shared.ANY_SCOPE, ('z', 's'), ('::layout horizontal', 'Split layout')),
+            (shared.ANY_SCOPE, ('z', 't'), ('::layout tabbed', 'Tabbed layout')),
+            (shared.ANY_SCOPE, (':', ), ('enter-command',)),
+            (shared.ANY_SCOPE, ('^L', ), ('repaint',)),
             (DocPanel.SCOPE, ('e', ), ('edit-metadata',)),
             (DocPanel.SCOPE, ('E', ), ('edit-metadata-external',)),
             (FilePanel.SCOPE, ('e', ), ('edit-metadata',)),
             (FilePanel.SCOPE, ('E', ), ('edit-metadata-external',)),
             (EditorPanel.SCOPE, ('E', ), ('edit-metadata-external',)),
-            (ANY_SCOPE, ('^R', ), ('refresh',)),
+            (shared.ANY_SCOPE, ('^R', ), ('refresh',)),
             (FilePanel.SCOPE, ('m', ), ('::mark',)),
             (DocPanel.SCOPE, ('m', ), ('::mark',)),
             (FilePanel.SCOPE, (Key.SPACE,), ('select',)),
             (FilePanel.SCOPE, ('u', 'v'), ('clear-selection',)),
             (FilePanel.SCOPE, ('v', ), ('invert-selection',)),
-            (ANY_SCOPE, ("'", ), ('::jump-to-mark',)),
-            (ANY_SCOPE, (Key.DOWN,), ('next-item',)),
-            (ANY_SCOPE, (Key.UP,), ('previous-item',)),
-            (ANY_SCOPE, (Key.PGUP,), ('previous-page',)),
-            (ANY_SCOPE, (Key.PGDN,), ('next-page',)),
-            (ANY_SCOPE, (Key.HOME,), ('go-to-start',)),
-            (ANY_SCOPE, (Key.END,), ('go-to-end',)),
+            (shared.ANY_SCOPE, ("'", ), ('::jump-to-mark',)),
+            (shared.ANY_SCOPE, (Key.DOWN,), ('next-item',)),
+            (shared.ANY_SCOPE, ('j',), ('next-item',)),
+            (shared.ANY_SCOPE, (Key.UP,), ('previous-item',)),
+            (shared.ANY_SCOPE, ('k',), ('previous-item',)),
+            (shared.ANY_SCOPE, (Key.PGUP,), ('previous-page',)),
+            (shared.ANY_SCOPE, (Key.PGDN,), ('next-page',)),
+            (shared.ANY_SCOPE, (Key.HOME,), ('go-to-start',)),
+            (shared.ANY_SCOPE, (Key.END,), ('go-to-end',)),
+            (shared.ANY_SCOPE, ('g', 'g'), ('go-to-start',)),
+            (shared.ANY_SCOPE, ('G',), ('go-to-end',)),
+            (shared.ANY_SCOPE, ('/',), (':find',)),
+            (shared.ANY_SCOPE, ('n',), ('find-next',)),
+            (shared.ANY_SCOPE, ('N',), ('find-prev',)),
             (EditorPanel.SCOPE, (Key.RETURN,), ('edit-mode',)),
             (EditorPanel.SCOPE, ('i',), ('edit-mode',)),
             (EditorPanel.SCOPE, ('o',), ('add-value',)),
@@ -184,10 +213,19 @@ class Application(cursedspace.Application):
         self.key_help_panel = None
         self.command_input = None
         self.blocking_task = None
+        self.info_text_timestamp = None
+        self.info_text_timeout = datetime.timedelta(seconds=10)
 
         conf = configparser.ConfigParser(interpolation=None)
-        conf.read_dict({ALL_SCOPE: {PREF_OPENER: DEFAULT_OPENER}})
-        self.configuration = metaindex.configuration.BaseConfiguration(conf)
+        conf.read_dict({shared.ALL_SCOPE: {PREF_OPENER: DEFAULT_OPENER,
+                                           PREF_INFO_TIMEOUT: DEFAULT_INFO_TIMEOUT,
+                                           shared.PREF_BORDER: shared.DEFAULT_BORDER},
+                        EditorPanel.SCOPE: {
+                            EditorPanel.CONFIG_NO_COMPLETION: 'title',
+                            EditorPanel.CONFIG_TAGS: EditorPanel.CONFIG_TAGS_DEFAULT,
+                            },
+                        })
+        self.configuration = MetaIndexManagerConfiguration(conf)
         utils.parse_ls_colors()
         utils.parse_ls_icons()
 
@@ -198,7 +236,10 @@ class Application(cursedspace.Application):
         self.named_clipboard = {}
         # bookmarks are tuples (panel type, base path, selected item)
         self.bookmarks = {}
-        self.restore_bookmarks()
+        try:
+            self.restore_bookmarks()
+        except Exception as exc:
+            logger.debug("Failed to restore bookmarks: %s", exc)
 
         # during command execution paints are not executed, but enqueued
         self.prevent_paint = False
@@ -224,6 +265,8 @@ class Application(cursedspace.Application):
             ]
         self.start_locations = args.location
 
+        self.clipboard = Clipboard(self)
+
         self.command_history = []
         if HISTORYFILE.is_file():
             self.command_history = [line for line in HISTORYFILE.read_text().split("\n")
@@ -233,8 +276,15 @@ class Application(cursedspace.Application):
         self.cache = MemoryCache(self.metaindexconf)
         self.cache.start()
 
-        configpath = pathlib.Path(args.config).expanduser().resolve()
-        self.load_config_file(configpath)
+        self.known_programs = []
+        self.refresh_known_programs()
+
+        configpath = pathlib.Path(args.config).expanduser()
+        if configpath.parent.exists():
+            here = os.getcwd()
+            os.chdir(configpath.parent)
+            self.load_config_file(configpath)
+            os.chdir(here)
 
     def main(self):
         self.command_input = None
@@ -247,14 +297,23 @@ class Application(cursedspace.Application):
                     self.panels.append(DocPanel(self, searchterm=location))
             self.current_panel = self.panels[-1]
         else:
-            self.current_panel = DocPanel(self)
+            default_view = self.configuration.get(shared.ALL_SCOPE,
+                                                  shared.PREF_DEFAULT_PANEL,
+                                                  shared.DEFAULT_DEFAULT_PANEL)
+            logger.debug("default view configured to %s", default_view)
+            paneltype = find_panel_type(default_view)
+            if paneltype is None:
+                paneltype = DocPanel
+            self.current_panel = paneltype(self)
             self.panels.append(self.current_panel)
         self.resize_panels()
         self.paint()
+        self.set_term_title(shared.PROGRAMNAME)
 
         timed_out = False
         redraw = False
         self.screen.timeout(self.key_timeout)
+        self.info(f"Welcome to {shared.PROGRAMNAME}")
 
         # quit when there are no panels (left) to display
         while len(self.panels) > 0:
@@ -270,6 +329,9 @@ class Application(cursedspace.Application):
                     except curses.error:
                         pass
                     redraw = True
+
+                    if redraw and self.blocking_task is not None:
+                        self.blocking_task.paint()
 
             if not timed_out or redraw:
                 if self.key_help_panel is not None:
@@ -337,9 +399,13 @@ class Application(cursedspace.Application):
                         if commandname.startswith('::'):
                             args = shlex.split(commandname[2:])
                             commandname = args.pop(0)
+                            args = sum([expand_part(self, part)
+                                        for part in args],
+                                       start=[])
 
                         command = resolve_command(commandname)
-                        if command is not None and isinstance(self.current_panel, command.ACCEPT_IN):
+                        if command is not None and \
+                           isinstance(self.current_panel, command.ACCEPT_IN):
                             if args is None:
                                 self.execute_command(commandname)
                             else:
@@ -350,6 +416,10 @@ class Application(cursedspace.Application):
                     if self.key_help_panel is None:
                         # last resort: maybe a panel has some use for this special key
                         self.current_panel.handle_key(seq)
+
+            if self.info_text_timestamp is not None and \
+               datetime.datetime.now() > self.info_text_timestamp + self.info_text_timeout:
+                self.clear_info_text()
 
     def run(self):
         stored_exc = None
@@ -362,7 +432,7 @@ class Application(cursedspace.Application):
         self.cache.quit()
 
         try:
-            history_size = int(self.configuration.get(ALL_SCOPE,
+            history_size = int(self.configuration.get(shared.ALL_SCOPE,
                                                       PREF_HIST_SIZE,
                                                       DEFAULT_HIST_SIZE))
         except ValueError:
@@ -397,7 +467,9 @@ class Application(cursedspace.Application):
         if isinstance(command, str):
             command = resolve_command(command)
 
-        if type(command).__name__ == 'type' and issubclass(command, Command):
+        if command is not None and \
+           type(command).__name__ == 'type' and \
+           issubclass(command, Command):
             command = command()
 
         if command is None:
@@ -411,7 +483,12 @@ class Application(cursedspace.Application):
             self.queued_paint = []
             cleanup = True
 
-        command.execute(self.make_context(), *args, **kwargs)
+        try:
+            command.execute(self.make_context(), *args, **kwargs)
+        except Exception as exc:
+            logger.error("Execution of %s failed: %s", command.NAME, exc)
+            logger.debug(''.join(traceback.format_tb(exc.__traceback__)))
+            self.error(f"Command failed: {exc}")
 
         if cleanup:
             self.prevent_paint = False
@@ -422,7 +499,7 @@ class Application(cursedspace.Application):
     def resolve_key_sequence(self):
         tplkeys = tuple(self.key_sequence)
         for scope, keys, commands in self.keys:
-            if scope not in [ANY_SCOPE, getattr(self.current_panel, 'SCOPE', None)]:
+            if scope not in [shared.ANY_SCOPE, getattr(self.current_panel, 'SCOPE', None)]:
                 continue
             if keys == tplkeys:
                 return commands
@@ -434,7 +511,7 @@ class Application(cursedspace.Application):
         curseq = self.key_sequence
         candidates = []
         for scope, keys, cmd in self.keys:
-            if scope not in [ANY_SCOPE, getattr(self.current_panel, 'SCOPE', None)]:
+            if scope not in [shared.ANY_SCOPE, getattr(self.current_panel, 'SCOPE', None)]:
                 continue
             if list(keys)[:len(curseq)] != curseq:
                 continue
@@ -512,6 +589,8 @@ class Application(cursedspace.Application):
         if len(self.panels) < 1:
             return
 
+        super().refresh(force)
+
         self.layout.refresh(force)
 
         if self.command_input is not None:
@@ -520,7 +599,6 @@ class Application(cursedspace.Application):
             self.key_help_panel.refresh(force)
         if self.blocking_task is not None:
             self.blocking_task.refresh(force)
-        super().refresh(force)
 
     def add_panel(self, panel):
         """Add this panel to the list of active panels"""
@@ -543,7 +621,11 @@ class Application(cursedspace.Application):
             self.previous_focus = None if len(self.panels) == 0 else self.panels[0]
         self.current_panel = panel
 
+        if self.previous_focus is not None and hasattr(self.previous_focus, 'on_focus_lost'):
+            self.previous_focus.on_focus_lost()
         self.layout.activated_panel(panel)
+        if hasattr(panel, 'on_focus'):
+            panel.on_focus()
 
     def close_panel(self, panel):
         if panel not in self.panels:
@@ -603,7 +685,10 @@ class Application(cursedspace.Application):
 
     def paint_focus_bar(self):
         _, width = self.size()
-        self.screen.addstr(0, 0, " "*width)
+        try:
+            self.screen.addstr(0, 0, " "*width)
+        except curses.error:
+            pass
         panels = [f' {nr+1}' for nr in range(len(self.panels))]
 
         curidx = -1
@@ -617,83 +702,27 @@ class Application(cursedspace.Application):
         if 0 <= curidx < len(self.panels):
             activepanel = self.panels[curidx]
             title = activepanel.title()
-        self.screen.addstr(0, 0, title[:width-1])
+        try:
+            self.screen.addstr(0, 0, title[:width-1])
+        except curses.error:
+            pass
         self.screen.noutrefresh()
 
         x = width - len(''.join(panels))
         for idx, text in enumerate(panels):
             attr = curses.A_STANDOUT if idx == curidx else curses.A_NORMAL
-            self.screen.addstr(0, x, text, attr)
+            try:
+                self.screen.addstr(0, x, text, attr)
+            except curses.error:
+                pass
             x += len(text)
         self.screen.noutrefresh()
-
-    def set_clipboard(self, content, clipboard=None):
-        """Set the content of the clipboard with the given identifier
-
-        A named clipboard is always a flat list of things (usually pathlib.Path items).
-        """
-        if clipboard is None:
-            clipboard = self.DEFAULT_CLIPBOARD
-
-        if clipboard not in self.named_clipboard:
-            self.named_clipboard[clipboard] = []
-
-        if content is None:
-            self.clear_clipboard(clipboard)
-            return
-
-        if isinstance(content, (list, tuple, set)):
-            self.named_clipboard[clipboard] = list(content)
-        else:
-            self.named_clipboard[clipboard] = [content]
-        logger.debug(f"Clipboard '{clipboard}' is now: {self.named_clipboard[clipboard]}")
-
-    def append_to_clipboard(self, content, clipboard=None):
-        """Append the content to the clipboard with the given identifier
-
-        See set_clipboard for more details
-        """
-        if clipboard is None:
-            clipboard = self.DEFAULT_CLIPBOARD
-
-        if clipboard not in self.named_clipboard:
-            self.named_clipboard[clipboard] = []
-
-        if isinstance(content, (list, tuple, set)):
-            self.named_clipboard[clipboard] += list(content)
-        else:
-            self.named_clipboard[clipboard].append(content)
-        logger.debug(f"Clipboard '{clipboard}' is now: {self.named_clipboard[clipboard]}")
-
-    def clear_clipboard(self, clipboard=None):
-        """Clear the clipboard with the given identifier
-
-        See set_clipboard for more details
-        """
-        if clipboard is None:
-            clipboard = self.DEFAULT_CLIPBOARD
-
-        if clipboard in self.named_clipboard:
-            del self.named_clipboard[clipboard]
-        logger.debug(f"Cleared clipboard '{clipboard}'")
-
-    def get_clipboard_content(self, clipboard=None):
-        """Get the content of the clipboard with the given identifier
-
-        See set_clipboard for more details
-        """
-        if clipboard is None:
-            clipboard = self.DEFAULT_CLIPBOARD
-
-        if clipboard not in self.named_clipboard:
-            return None
-
-        return self.named_clipboard[clipboard]
 
     def save_bookmark(self, mark, panel, path, item):
         """Store this bookmark"""
         self.bookmarks[mark] = (type(panel), path, item)
         self.store_bookmarks()
+        self.clear_info_text()
 
     def load_bookmark(self, mark):
         """Restore this bookmark, create a panel if required"""
@@ -704,15 +733,14 @@ class Application(cursedspace.Application):
 
         paneltype, path, item = self.bookmarks[mark]
 
-        if type(self.current_panel) is paneltype and (not hasattr(self.current_panel, 'is_busy') or not self.current_panel.is_busy):
+        if type(self.current_panel) is paneltype and \
+           (not hasattr(self.current_panel, 'is_busy') or not self.current_panel.is_busy):
             self.current_panel.jump_to(item, path)
         else:
-            if issubclass(paneltype, FilePanel):
-                panel = paneltype(self, path=path)
-            elif issubclass(paneltype, DocPanel):
-                panel = paneltype(self, searchterm=path)
-            else:
-                msg = f"Unexpected panel type in bookmarks: {paneltype}"
+            try:
+                panel = paneltype(self, path)
+            except Exception as exc:
+                msg = f"Error loading bookmark for {paneltype}: {exc}"
                 logger.error(msg)
                 self.error(msg)
                 return
@@ -720,13 +748,14 @@ class Application(cursedspace.Application):
             self.activate_panel(panel)
 
             panel.jump_to(item)
+        self.clear_info_text()
 
     def restore_bookmarks(self):
         """Load the previously defined bookmarks from disk
 
         Bookmarks are stored one per line in plain text in this format:
 
-            <mark> [f|d] <path> <path to item>
+            <mark> <panel type> <path> <path to item>
 
         """
         if not BOOKMARKFILE.is_file():
@@ -736,8 +765,6 @@ class Application(cursedspace.Application):
             parts = shlex.split(line)
             if len(parts) != 4:
                 continue
-            if parts[1] not in 'fd':
-                continue
 
             mark, typename, path, item = parts
             if len(item) == 0:
@@ -745,14 +772,10 @@ class Application(cursedspace.Application):
             if item is not None:
                 item = pathlib.Path(item)
 
-            paneltype = None
-            if typename == 'f':
-                paneltype = FilePanel
-                path = pathlib.Path(path)
-            elif typename == 'd':
-                paneltype = DocPanel
-            else:
-                raise NotImplementedError(f"Unknown panel type {typename}")
+            paneltype = find_panel_type(typename)
+            if paneltype is None:
+                logger.warning(f"Unknown panel type {typename}")
+                continue
 
             self.bookmarks[mark] = (paneltype, path, item)
 
@@ -760,7 +783,7 @@ class Application(cursedspace.Application):
         """Save the bookmarks to disk"""
         with open(BOOKMARKFILE, 'wt', encoding='utf-8') as fh:
             for mark in sorted(self.bookmarks.keys()):
-                typename = 'd' if self.bookmarks[mark][0] is DocPanel else 'f'
+                typename = self.bookmarks[mark][0].SCOPE
                 line = [mark, typename] + [str(v) for v in self.bookmarks[mark][1:]]
                 fh.write(shlex.join(line) + "\n")
 
@@ -772,11 +795,30 @@ class Application(cursedspace.Application):
             self.apply_config_changes()
 
     def apply_config_changes(self):
-        if len(self.queued_config_change) > 0:
-            for scope, name in self.queued_config_change:
-                for panel in self.panels:
-                    if scope in [panel.SCOPE, 'all']:
-                        panel.configuration_changed(name)
+        must_repaint = False
+        if self.queued_config_change is not None and len(self.queued_config_change) == 0:
+            self.queued_config_change = None
+        if self.queued_config_change is None:
+            return
+
+        for scope, name in self.queued_config_change:
+            if scope == shared.ALL_SCOPE and \
+               name == shared.PREF_BORDER and \
+               self.layout is not None and self.screen is not None:
+                self.layout.resize_panels()
+                must_repaint = True
+            elif scope == shared.ALL_SCOPE and name == PREF_INFO_TIMEOUT:
+                raw_value = self.configuration.get(scope, name, DEFAULT_INFO_TIMEOUT)
+                try:
+                    value = utils.parse_duration(raw_value)
+                    self.info_text_timeout = value
+                except ValueError as exc:
+                    self.error(f"{raw_value} is not a valid duration: {exc}")
+            for panel in self.panels:
+                if scope in [panel.SCOPE, shared.ALL_SCOPE]:
+                    panel.configuration_changed(name)
+        if must_repaint and self.layout is not None:
+            self.layout.paint(True)
         self.queued_config_change = None
 
     def load_config_file(self, path, context=None):
@@ -823,13 +865,19 @@ class Application(cursedspace.Application):
 
     def open_file(self, path):
         assert path.is_file()
-        opener = shlex.split(self.configuration.get("all", "opener", DEFAULT_OPENER))
+        opener = shlex.split(self.configuration.get(shared.ALL_SCOPE, PREF_OPENER, DEFAULT_OPENER))
         if len(opener) == 0:
             # TODO: check for existing file
             return
+        self.open_with(path, opener)
+
+    def open_with(self, path, cmd):
+        use_shell = len(cmd) == 0
+
         with ShellContext(self.screen):
-            subprocess.run(opener + [str(path)])
+            subprocess.run(cmd + [str(path)], shell=use_shell, check=True)
         self.paint(True)
+        self.set_term_title(shared.PROGRAMNAME)
 
     def get_text_editor(self, show_error=False):
         """Resolve the external text editor to use"""
@@ -850,6 +898,7 @@ class Application(cursedspace.Application):
 
     def make_command_input(self, text=""):
         assert self.command_input is None
+        self.clear_info_text()
         self.command_input = CommandInput(self, 1, (0, 0), prefix=":", text=text)
         self.command_input.cursor = len(text)
         self.resize_panels()
@@ -881,25 +930,63 @@ class Application(cursedspace.Application):
 
         size = self.size()
         display = text[:size[1]] + " "*max(0, size[1]-len(text))
+        self.info_text_timestamp = datetime.datetime.now()
         try:
             self.screen.addstr(size[0]-1, 0, display, attr)
-        except:
+        except curses.error:
             pass
         self.screen.refresh()
 
-    def humanize(self, value):
-        """Convert any metadata value to a human-friendly string"""
-        if isinstance(value, datetime.datetime):
-            value = value.strftime("%Y-%m-%d %H:%M:%S")
-        elif isinstance(value, datetime.date):
-            value = value.strftime("%Y-%m-%d")
-        elif isinstance(value, (int, float, bool)):
-            value = str(value)
-        elif not isinstance(value, str):
-            logger.debug("Unexpected type '%s' to humanize", type(value))
-            value = str(value)
+    def clear_info_text(self):
+        if self.info_text_timestamp is None:
+            return
+        self.info_text_timestamp = None
+        size = self.size()
+        try:
+            self.screen.addstr(size[0]-1, 0, " "*size[1])
+        except curses.error:
+            pass
+        self.screen.noutrefresh()
+        self.current_panel.focus()
+        self.current_panel.win.noutrefresh()
+        curses.doupdate()
 
-        return value.replace('\0', '').strip()
+    def refresh_known_programs(self):
+        threading.Thread(target=self._do_refresh_known_programs).start()
+
+    def _do_refresh_known_programs(self):
+        paths = [pathlib.Path(p)
+                 for p in os.getenv('PATH', os.defpath).split(os.pathsep)]
+        programs = set()
+        for path in paths:
+            try:
+                if not path.is_dir() or not os.access(path, os.X_OK):
+                    continue
+            except OSError:
+                continue
+            for item in path.iterdir():
+                try:
+                    if item.is_file() and os.access(item, os.F_OK | os.X_OK):
+                        programs.add(item)
+                except OSError:
+                    pass
+        self.known_programs = list(sorted(programs))
+
+    @staticmethod
+    def as_printable(value, shorten=100):
+        """Clean up a string to make it printable
+
+        Shorten the value to ``shorten`` characters.
+        If ``shorten`` is None, no shortening will happend.
+        """
+        if value is None:
+            return ''
+        text = str(value)
+        if shorten is not None:
+            text = text[:shorten]
+        return (''.join(letter
+                        for letter in text
+                        if letter.isprintable())).strip().replace('\t', ' ')
 
     @property
     def collection_metadata(self):
@@ -919,6 +1006,14 @@ def parse_args():
                         default=CONFIGFILE,
                         type=str,
                         help="Location of the configuration file. Defaults to %(default)s.")
+
+    parser.add_argument('-v', '--version',
+                        action='version',
+                        version=f'%(prog)s {version.__version__}')
+    parser.add_argument('--check-for-update',
+                        default=False,
+                        action="store_true",
+                        help="Check online whether a new version is available")
 
     parser.add_argument('-l', '--log-level',
                         default='warning',
@@ -955,7 +1050,27 @@ def run():
 
     logger.setup(level=args.log_level.upper(), filename=args.log_file)
 
+    if args.check_for_update:
+        try:
+            response = urllib.request.urlopen('https://vonshednob.cc/metaindexmanager/latest')
+            remote_version = str(response.read(), 'ascii')
+            if remote_version.startswith('v'):
+                remote_version = remote_version[1:]
+        except Exception as exc:
+            print(f"Could get the latest version from vonshednob.cc: {exc}")
+            return 1
+
+        if remote_version > version.__version__:
+            print("A newer version of metaindexmanager is available.")
+        elif version.__version__ > remote_version:
+            print("Your version is NOT in line with the released version!")
+        else:
+            print("You are up to date.")
+
+        return 0
+
     logger.debug("Starting metaindexmanager")
+    logging.getLogger().addHandler(logger.handler)
 
     if args.log_level.lower() in ['debug']:
         metaindex.logger.setup(level=logging.DEBUG, filename=args.log_file.parent / 'metaindex.log')
@@ -964,9 +1079,11 @@ def run():
 
     if ADDONSPATH.exists():
         prev_sys_path = sys.path.copy()
-        sys.path = [str(ADDONSPATH)]
+        sys.path = [str(ADDONSPATH)] + sys.path
         for item in ADDONSPATH.iterdir():
             if item.is_file() and item.suffix == '.py':
+                importlib.import_module(item.stem)
+            elif item.is_dir() and (item / '__init__.py').is_file():
                 importlib.import_module(item.stem)
         sys.path = prev_sys_path
 

@@ -1,6 +1,7 @@
 """Layout definitions"""
 from cursedspace import Panel
 
+from metaindexmanager import shared
 from metaindexmanager.utils import logger
 
 
@@ -27,6 +28,12 @@ def get_layout(name):
 class Layout:
     def __init__(self, application):
         self.app = application
+
+    def border_style(self):
+        """Return the configured border style"""
+        return self.app.configuration.get(shared.ALL_SCOPE,
+                                          shared.PREF_BORDER,
+                                          shared.DEFAULT_BORDER)
 
     def refresh(self, force):
         """Called during Application.refresh"""
@@ -59,15 +66,24 @@ class HorizontalLayout(Layout):
 
     def resize_panels(self):
         maxheight, maxwidth = self.app.size()
-        maxheight -= 2  # border
+        maxheight -= 2
         posx = 0
+        border = self.border_style()
 
         width = maxwidth // len(self.app.panels)
         for panel in self.app.panels:
             panelwidth = width
             if panel is self.app.panels[-1]:
                 panelwidth = maxwidth - posx
-            panel.border = Panel.BORDER_ALL
+
+            if border == shared.BORDER_MINIMAL:
+                if panel is not self.app.panels[-1] and \
+                   len(self.app.panels) > 1:
+                    panel.border = Panel.BORDER_RIGHT
+                else:
+                    panel.border = Panel.BORDER_NONE
+            else:
+                panel.border = Panel.BORDER_ALL
             panel.resize(maxheight, panelwidth)
             panel.move(1, posx)
             logger.debug(f"Resized panel {panel} to {maxheight},{panelwidth}")
@@ -109,9 +125,13 @@ class TabbedLayout(Layout):
     def resize_panels(self):
         maxheight, maxwidth = self.app.size()
         maxheight -= 2  # border
+        border = Panel.BORDER_ALL
+
+        if self.border_style() == shared.BORDER_MINIMAL:
+            border = Panel.BORDER_NONE
 
         for panel in self.app.panels:
-            panel.border = Panel.BORDER_ALL
+            panel.border = border
             panel.resize(maxheight, maxwidth)
             panel.move(1, 0)
 
@@ -124,4 +144,3 @@ class TabbedLayout(Layout):
         if activepanel is not None:
             activepanel.paint(clear)
             activepanel.win.refresh()
-
